@@ -100,14 +100,28 @@ cd ~/actions-runner
 on first run. `$REPO_SLUG` label lets workflows pin `runs-on` to this repo's
 runner if you ever run multi-repo on one VM.)
 
-## Step 5 — enable the service
+## Step 5 — enable the service (install the hardened unit first)
 
-The unit is pre-baked (disabled) on the template. Just enable:
+The template ships the unit **disabled** — but the pre-baked unit sets no
+`Environment`/`PATH`, so systemd starts the runner with its minimal default
+PATH (no mise, no `~/.local/bin`). The runner's `env.sh` then captures that
+mise-less PATH into `~/actions-runner/.path`, and every job shell inherits it →
+`bundle`/`ruby`/`pi` resolve as `command not found` (exit 127).
+
+**Always** overlay the hardened unit that puts mise on PATH (mirrors what
+devloop bakes into its units), then enable:
 ```bash
+sudo cp ~/factory/templates/systemd/gh-actions-runner.service \
+  /etc/systemd/system/gh-actions-runner.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now gh-actions-runner.service
 sleep 2
 systemctl is-active gh-actions-runner.service   # → active
+```
+Verify the runner captured a mise-bearing PATH (this is what job shells get):
+```bash
+grep -q "mise/shims" ~/actions-runner/.path \
+  || die "runner .path lacks mise — jobs will fail with 'command not found'"
 ```
 
 ## Step 6 — ensure workflows in the repo
