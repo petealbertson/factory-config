@@ -1,0 +1,24 @@
+name: Fix
+
+# Fires when the reviewer labels a PR `fixes-requested`. One fix pass per
+# invocation; run.sh re-labels `ready-for-review`, which fires the next review.
+on:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: factory-fix-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: github.event.label.name == 'fixes-requested'
+    runs-on: [self-hosted, linux, X64]
+    timeout-minutes: 25
+    steps:
+      - name: Run factory
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          cd ~/factory
+          bash run.sh fix "$PR_NUMBER"

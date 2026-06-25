@@ -11,25 +11,35 @@ service. GitHub long-polls the runner directly — no exe.dev API in the path,
 no SSH dispatch, no timeout. Workflows use `runs-on: [self-hosted, linux, X64]`
 and their `run:` steps execute locally, calling `~/factory/run.sh`.
 
+The loop is a **label-driven state machine** — one state label on a PR at a
+time, transitions drive the next step. No review fires on push; only at
+explicit state transitions.
+
 ```
-issue labeled 'ready'        ─► run.sh implement <n>   ─► PR
-PR opened/synchronize        ─► run.sh review-and-fix <n>
-PR labeled 'human-review'    ─► run.sh human-review <n> ─► app on proxied port
-PR closed                    ─► run.sh teardown <n>
+issue: ready-for-implementation ──► run.sh implement ──► PR: ready-for-review
+PR: ready-for-review             ──► run.sh review
+  ├─ 0 findings (or round 3)     ──► needs-human-review  (terminal)
+  └─ findings + round < 3        ──► fixes-requested ──► run.sh fix ──► ready-for-review
+PR closed                        ──► run.sh teardown
 ```
+
+Pull up any PR and its single state label tells you where it is. Bounded at 3
+review passes (initial + 2 fix rounds); if it can't converge, it lands on
+`needs-human-review` with the last findings instead of looping.
 
 ## What's here
 
 | Path | Purpose |
 |---|---|
-| `run.sh` | The runner. Subcommands: `implement`, `review-and-fix`, `human-review`, `stop-server`, `teardown`. |
+| `run.sh` | The runner. Subcommands: `implement`, `review`, `fix`, `teardown`. |
 | `.agents/skills/` | The `implementation` and `review` Pi skills (used by `run.sh`). |
 | `models.env` | Role → model bindings. Edit + commit + fan out to swap models. |
 | `templates/github/workflows/` | The four Actions, copied into consuming repos. |
 | `shelley-skills/factory-install/` | Skill: bind a fresh VM to a repo (register runner, write repo.env, ensure workflows/labels). |
 | `shelley-skills/factory-ops/` | Skill: add/swap inference providers, models, list VMs. |
 
-Not in git: `repo.env` (per-VM, written by `factory-install`), `servers/`.
+Not in git: `repo.env` (per-VM, written by `factory-install`), `state/`
+(per-PR round counter + last findings, wiped on teardown).
 
 ## Sources of truth
 
@@ -60,7 +70,7 @@ ssh exe.dev cp rails-vm-template new-app-vm
 > use `rails-exe-setup` for `petealbertson/new-app`
 > then use `factory-install` for `petealbertson/new-app`
 
-Label an issue `ready`. It fires end-to-end.
+Label an issue `ready-for-implementation`. It fires end-to-end.
 
 ## Refresh a repo VM (the monthly flow)
 
@@ -76,10 +86,11 @@ the app checkout, unaffected.
 ## Lifecycle
 
 ```
-plan (interactive) → issue → label 'ready'
-  → implement → PR → review-and-fix (max 2 rounds, zero findings = done)
-  → label 'human-review' → app served on a proxied port → you merge
-  → teardown (PR closed)
+plan (interactive) → issue → label 'ready-for-implementation'
+  → implement → PR: ready-for-review
+  → review → fixes-requested → fix → ready-for-review  (max 3 reviews)
+  → needs-human-review → you smoke-test on the VM → you merge
+  → teardown (PR closed: worktree + DB + branch gone, main synced)
 ```
 
 ## Inference

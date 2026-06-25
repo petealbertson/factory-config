@@ -8,6 +8,14 @@ Review a pull request and emit findings. **Every finding you emit is must-fix.**
 
 You run inside the PR's worktree. The branch and PR number are in your prompt.
 
+## Approval
+
+There is no "approved with comments" state. **Approval is emitting zero
+findings** — that single signal flips the PR to `needs-human-review`. So the
+emission bar below cuts both ways: emit a finding only if it's worth a fix
+round; withhold if it's not. The loop is capped at 3 review passes, so
+nitpicking burns the budget that should go to real issues.
+
 ## Emission bar
 
 Before emitting a finding, apply this test:

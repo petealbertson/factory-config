@@ -4,7 +4,7 @@ description: |
   Bind a freshly copied factory VM to one GitHub repo so GitHub events run on
   this VM. Registers the self-hosted GitHub Actions runner (using the
   repo-scoped token minted by the VM's own `gh`), writes repo.env, ensures the
-  repo has the four factory workflows + labels, and enables the runner service.
+  repo has the factory workflows + state labels, and enables the runner service.
   Idempotent — safe to re-run after a template refresh. Use when the user says
   "set up / install / configure the factory on <repo>" or "wire <repo> to the
   factory" on a VM copied from rails-vm-template. No manual tokens or secrets.
@@ -12,9 +12,9 @@ description: |
 
 # Factory Install — bind this VM to one GitHub repo
 
-Goal: after this runs, an issue labeled `ready` on `<owner>/<repo>` fires the
-factory end-to-end on *this* VM. Nothing leaves the VM; the runner long-polls
-GitHub directly.
+Goal: after this runs, an issue labeled `ready-for-implementation` on
+`<owner>/<repo>` fires the factory end-to-end on *this* VM. Nothing leaves the
+VM; the runner long-polls GitHub directly.
 
 The template (`rails-vm-template`) ships pre-baked: `~/factory` (this repo's
 clone), `~/actions-runner/` (runner binary, **no registration**), and a
@@ -127,31 +127,47 @@ grep -q "mise/shims" ~/actions-runner/.path \
 ## Step 6 — ensure workflows in the repo
 
 Copy the four factory workflows; commit only if changed. **Add files
-explicitly** (VM policy forbids `git add -A`/`git add .`):
+explicitly** (VM policy forbids `git add -A`/`git add .`). First copy, then
+remove any stale `review-and-fix.yml` / `human-review.yml` left from the old
+design (label-driven state machine replaced push-driven review + the smoke
+server):
 ```bash
 mkdir -p "$REPO_DIR/.github/workflows"
 cp ~/factory/templates/github/workflows/*.yml "$REPO_DIR/.github/workflows/"
+rm -f "$REPO_DIR/.github/workflows/review-and-fix.yml" \
+      "$REPO_DIR/.github/workflows/human-review.yml"
 cd "$REPO_DIR"
 if ! git diff --quiet -- .github/workflows 2>/dev/null \
    || [ -n "$(git ls-files --others --exclude-standard -- .github/workflows)" ]; then
   git add .github/workflows/implement-ready-issues.yml \
-          .github/workflows/review-and-fix.yml \
-          .github/workflows/human-review.yml \
+          .github/workflows/review.yml \
+          .github/workflows/fix.yml \
           .github/workflows/teardown.yml
-  git commit -m "factory: workflows"
+  git rm --cached .github/workflows/review-and-fix.yml \
+             .github/workflows/human-review.yml 2>/dev/null || true
+  git commit -m "factory: workflows (label-driven state machine)"
   git push
 fi
 ```
 
 ## Step 7 — labels
 
-Idempotent (`|| true` — `gh` errors if a label exists):
+The loop is a label-driven state machine. One **state** label is present on a
+PR at a time (the runner removes the old before adding the new on every
+transition). Seed all of them; idempotent (`|| true` — `gh` errors if a label
+exists):
 ```bash
-gh label create ready --repo "$REPO_SLUG" --color 0E8A16 \
-  --description "Plan approved; factory will implement" 2>/dev/null || true
-gh label create human-review --repo "$REPO_SLUG" --color 5319E7 \
-  --description "PR ready for human smoke test on the VM" 2>/dev/null || true
+gh label create ready-for-implementation --repo "$REPO_SLUG" --color 0E8A16 \
+  --description "Issue planned; factory will implement" 2>/dev/null || true
+gh label create ready-for-review     --repo "$REPO_SLUG" --color 1D76DB \
+  --description "PR awaiting the reviewer agent" 2>/dev/null || true
+gh label create fixes-requested      --repo "$REPO_SLUG" --color D93F0B \
+  --description "Reviewer found issues; awaiting a fix pass" 2>/dev/null || true
+gh label create needs-human-review   --repo "$REPO_SLUG" --color 5319E7 \
+  --description "Agents done (approved or capped); waiting on a human" 2>/dev/null || true
 ```
+Only `ready-for-implementation` (issue) and the three PR labels are trigger
+labels for the workflows; `needs-human-review` is terminal.
 
 ## Step 8 — verify the loop
 
@@ -169,9 +185,10 @@ One line + the trigger recipe. No narrative:
 
 - ✅ `<owner>/<repo>` is wired. Runner online.
 - To fire: create an issue, plan it with an agent, then `gh issue edit <n>
-  --repo <owner>/<repo> --add-label ready`.
-- Smoke test a merged PR: label it `human-review` → app on
-  `https://$(hostname).exe.xyz:<port>`.
+  --repo <owner>/<repo> --add-label ready-for-implementation`.
+- The PR will walk `ready-for-review` → `fixes-requested` → `needs-human-review`
+  on its own. Watch for `needs-human-review`; smoke-test the branch on the VM
+  directly, then merge to trigger teardown.
 
 ## Re-run / refresh
 

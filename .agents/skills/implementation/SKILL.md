@@ -41,7 +41,21 @@ Run the repo's test command. At minimum: the targeted test, then the full suite 
 Then comment on the issue with the PR URL. Do **not** describe the work as complete before the PR exists.
 
 ### 7. Fix pass (when the prompt contains a "Findings:" block)
-Address **every** finding. Each finding is must-fix by contract. Commit and push to the current branch. Do **not** open a new PR. Do not comment on the issue. Run the tests again.
+This is a fix pass on an existing branch, driven by reviewer findings.
+
+**Validate each finding before fixing.** A finding is a request, not an
+order — read it, confirm it applies, then either:
+- **Fix it** — make the smallest change that resolves it, in the established
+  style. Update tests if the behavior changed.
+- **Push back** — if a finding is wrong, already-addressed, or would harm the
+  code, **do not silently ignore it.** Post a comment on the PR explaining why
+  you disagree (one or two sentences, referencing the finding id, e.g. "F2:
+  …"), and leave that code unchanged.
+
+Either way: commit and push to the current branch. Do **not** open a new PR.
+Do not comment on the issue. Run the tests again. The reviewer will re-review
+on the next pass; pushing back on a finding is how you converge honestly
+rather than gaming the count.
 
 ## Guardrails
 
@@ -51,3 +65,5 @@ Address **every** finding. Each finding is must-fix by contract. Commit and push
 - Never claim validation passed if it did not run or failed.
 - Initial pass: do not post "done" without a PR URL.
 - Fix pass: do not open a new PR; push to the existing branch only.
+- Fix pass: never silently drop a finding. Fix it, or post a comment on the PR
+  explaining why you disagree. Silent drops are how loops stall.

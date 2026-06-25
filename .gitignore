@@ -1,4 +1,5 @@
 repo.env
 servers/
+state/
 *.log
 *.pid

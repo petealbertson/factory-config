@@ -10,7 +10,7 @@ concurrency:
 
 jobs:
   implement:
-    if: github.event.label.name == 'ready'
+    if: github.event.label.name == 'ready-for-implementation'
     runs-on: [self-hosted, linux, X64]
     timeout-minutes: 20
     steps:

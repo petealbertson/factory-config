@@ -9,7 +9,7 @@ Manage the configuration of the cloud factory. The factory runs on per-repo exe.
 
 ## Layout (memorize this)
 
-- `~/factory/run.sh` — the runner. Subcommands: implement, review-and-fix, human-review, stop-server, teardown.
+- `~/factory/run.sh` — the runner. Subcommands: implement, review, fix, teardown.
 - `~/factory/models.env` — role→model bindings (`IMPLEMENT_MODEL`, `REVIEW_MODEL`, `FIX_MODEL`). **The file you edit to swap models.**
 - `~/.pi/agent/models.json` — provider/model registry. Edit when adding a provider.
 - `~/.pi/agent/auth.json` — provider credentials. **Never edit by hand, never read aloud, never echo.**
