@@ -17,7 +17,15 @@ TOKEN_FILE="${EXEDEV_TOKEN_FILE:-$HOME/.config/factory/exedev-token}"
 command -v gh >/dev/null || { echo "gh CLI required" >&2; exit 1; }
 
 if [ ! -s "$TOKEN_FILE" ]; then
-  echo "No token at $TOKEN_FILE. Run scripts/bootstrap-token.sh first." >&2
+  cat >&2 <<EOF
+No token at $TOKEN_FILE.
+Generate one on your laptop (where your exe.dev SSH key is):
+  ssh exe.dev ssh-key generate-api-key --label=factory-ci --exp=365d
+Then create the file on this VM and paste the exe1.... key into it:
+  mkdir -p $(dirname "$TOKEN_FILE") && chmod 700 $(dirname "$TOKEN_FILE")
+  # paste the key into: $TOKEN_FILE
+  chmod 600 "$TOKEN_FILE"
+EOF
   exit 1
 fi
 
