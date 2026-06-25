@@ -20,12 +20,16 @@ set -euo pipefail
 
 FACTORY_DIR="${FACTORY_DIR:-$HOME/factory}"
 
-# --- activate mise so ruby/bundle/rails resolve in any shell (runner job, ssh, cron) ---
+# --- activate mise so ruby/bundle/rails/pi resolve in any shell (runner job, ssh, cron) ---
 # The self-hosted runner job shell does NOT inherit the interactive login PATH,
-# so mise's shims are absent and `bundle` is unresolvable. mise activate is a
-# no-op if mise is missing or already on PATH.
+# so mise's shims are absent and `bundle`/`pi` are unresolvable.
+# Use `mise activate --shims` (not the default hook-based `mise activate`):
+# the default installs a chpwd/prompt hook that only fires on the NEXT cd/prompt,
+# which never happens inside a non-interactive `bash -e` job script. --shims
+# puts real shims on PATH immediately, so tools resolve regardless of CWD.
+# No-op if mise is missing or already activated.
 if command -v mise >/dev/null 2>&1; then
-  eval "$(mise activate bash)"
+  eval "$(mise activate --shims bash)"
 fi
 
 # --- PostgreSQL: bare psql/createdb/dropdb default the db name to the ---
