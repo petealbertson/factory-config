@@ -6,13 +6,12 @@ on:
 
 jobs:
   teardown:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
+    timeout-minutes: 5
     steps:
-      - name: Tear down PR stage on the worker VM
+      - name: Run factory
         env:
-          EXEDEV_API_TOKEN: ${{ secrets.EXEDEV_API_TOKEN }}
-          FACTORY_VM: ${{ vars.FACTORY_VM }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          curl -sS -X POST https://exe.dev/exec \
-            -H "Authorization: Bearer $EXEDEV_API_TOKEN" \
-            --data-raw "ssh $FACTORY_VM ~/factory/run.sh teardown ${{ github.event.pull_request.number }}"
+          cd ~/factory
+          bash run.sh teardown "$PR_NUMBER"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Cloud factory runner. Invoked on a per-repo VM by a GitHub Action via the
-# exe.dev HTTPS API:  ssh <vm> ~/factory/run.sh <kind> [args]
+# Cloud factory runner. Invoked on a per-repo VM by a self-hosted GitHub
+# Actions runner that runs on this same VM:
+#   bash ~/factory/run.sh <kind> [args]
 #
 # One VM == one repo (the "repo VM"). This script is repo-agnostic; the repo it
 # targets is declared in repo.env. It is Rails-aware (db:prepare, bin/rails s).

@@ -11,13 +11,12 @@ concurrency:
 jobs:
   implement:
     if: github.event.label.name == 'ready'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
+    timeout-minutes: 20
     steps:
-      - name: Trigger factory worker
+      - name: Run factory
         env:
-          EXEDEV_API_TOKEN: ${{ secrets.EXEDEV_API_TOKEN }}
-          FACTORY_VM: ${{ vars.FACTORY_VM }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
-          curl -sS -X POST https://exe.dev/exec \
-            -H "Authorization: Bearer $EXEDEV_API_TOKEN" \
-            --data-raw "ssh $FACTORY_VM ~/factory/run.sh implement ${{ github.event.issue.number }}"
+          cd ~/factory
+          bash run.sh implement "$ISSUE_NUMBER"
