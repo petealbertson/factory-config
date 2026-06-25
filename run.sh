@@ -20,6 +20,19 @@ set -euo pipefail
 
 FACTORY_DIR="${FACTORY_DIR:-$HOME/factory}"
 
+# --- activate mise so ruby/bundle/rails resolve in any shell (runner job, ssh, cron) ---
+# The self-hosted runner job shell does NOT inherit the interactive login PATH,
+# so mise's shims are absent and `bundle` is unresolvable. mise activate is a
+# no-op if mise is missing or already on PATH.
+if command -v mise >/dev/null 2>&1; then
+  eval "$(mise activate bash)"
+fi
+
+# --- PostgreSQL: bare psql/createdb/dropdb default the db name to the ---
+# --- connecting role (e.g. "exedev"), which has no same-named database. ---
+# --- Pin a real default db so `psql -tAc ...` works without -d.        ---
+export PGDATABASE="${PGDATABASE:-postgres}"
+
 # --- shared config (model bindings; safe to commit) ---
 # shellcheck source=/dev/null
 source "$FACTORY_DIR/models.env"
