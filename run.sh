@@ -103,7 +103,10 @@ run_pi() {
   [ -f "$skillfile" ] || skillfile="$REPO_DIR/.agents/skills/$skill/SKILL.md"
   log "pi: skill=$skill model=$model cwd=$cwd"
   cd "$cwd"
-  pi --model "$model" --cwd "$cwd" -p "$prompt"
+  # NOTE: this pi version has no --cwd flag; we already `cd "$cwd"` above so the
+  # working directory is correct. Callers embed the skill-file path in $prompt
+  # ("Read .../SKILL.md and follow it"), since --skill wiring is not used here.
+  pi --model "$model" -p "$prompt"
 }
 
 # ---------------------------------------------------------------- kind: implement
