@@ -10,7 +10,12 @@ WorkingDirectory=/home/exedev/actions-runner
 # ~/.local/share/mise/...). Without this, the runner captures a mise-less PATH
 # into ~/actions-runner/.path, and every job shell then lacks bundle/ruby/pi.
 # Mirror the PATH devloop bakes into its units.
-Environment="PATH=/home/exedev/.local/share/mise/installs/ruby/3.4.8/bin:/home/exedev/.local/share/mise/installs/node/22/bin:/home/exedev/.local/share/mise/installs/python/3.12/bin:/home/exedev/.local/share/mise/shims:/home/exedev/.local/bin:/headless-shell:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+#
+# Use mise SHIMS only — do NOT pin install-bin dirs by version (ruby/3.4.8/bin,
+# node/22/bin, ...). Those paths break on every toolchain upgrade (the template
+# ships ruby 4.0.5, not 3.4.8) and are redundant: shims already resolve to the
+# current version for ruby/bundle/rails/node/npm/pi/python3.
+Environment="PATH=/home/exedev/.local/share/mise/shims:/home/exedev/.local/bin:/headless-shell:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 Environment="HOME=/home/exedev"
 ExecStart=/home/exedev/actions-runner/run.sh
 Restart=always
