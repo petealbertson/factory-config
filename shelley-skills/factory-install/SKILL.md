@@ -30,6 +30,20 @@ already on the VM — **never ask the user for a token or a GitHub secret.**
 - `~/factory` present (clones itself if missing).
 - `~/actions-runner/run.sh` present (the binary). Bail with a clear message if
   not — that's a template-bake problem, not something to fix here.
+- **`gh` >= 2.60.** Older `gh` (e.g. the 2.45.0 shipped on Ubuntu Noble) hits a
+  hard error on any human-format `gh pr` call:
+  `GraphQL: Projects (classic) is being deprecated ... (repository.pullRequest.projectCards)`.
+  `run.sh`'s label-transition calls (`gh pr edit --add-label`/`--remove-label`)
+  trigger this internally → the job dies with exit 1 right after opening the
+  PR, so the PR never reaches `ready-for-review` and the review loop never
+  fires. Fix at install time:
+  ```bash
+  if ! gh --version | awk '/version/{exit !($2>="2.60")}'; then
+    ver=$(gh api repos/cli/cli/releases/latest --jq .tag_name | sed 's/v//')
+    curl -sL -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v$ver/gh_${ver}_linux_amd64.deb"
+    sudo dpkg -i /tmp/gh.deb && rm /tmp/gh.deb
+  fi
+  ```
 
 ## Inputs
 
