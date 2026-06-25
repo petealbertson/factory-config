@@ -1,0 +1,20 @@
+[Unit]
+Description=GitHub Actions Runner
+After=network.target
+
+[Service]
+Type=simple
+User=exedev
+WorkingDirectory=/home/exedev/actions-runner
+# systemd starts services with a minimal PATH that omits mise (~/.local/bin,
+# ~/.local/share/mise/...). Without this, the runner captures a mise-less PATH
+# into ~/actions-runner/.path, and every job shell then lacks bundle/ruby/pi.
+# Mirror the PATH devloop bakes into its units.
+Environment="PATH=/home/exedev/.local/share/mise/installs/ruby/3.4.8/bin:/home/exedev/.local/share/mise/installs/node/22/bin:/home/exedev/.local/share/mise/installs/python/3.12/bin:/home/exedev/.local/share/mise/shims:/home/exedev/.local/bin:/headless-shell:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+Environment="HOME=/home/exedev"
+ExecStart=/home/exedev/actions-runner/run.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
