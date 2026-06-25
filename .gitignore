@@ -1,0 +1,4 @@
+repo.env
+servers/
+*.log
+*.pid

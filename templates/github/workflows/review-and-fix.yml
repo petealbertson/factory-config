@@ -1,0 +1,22 @@
+name: Review and Fix
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: factory-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger review-and-fix loop
+        env:
+          EXEDEV_API_TOKEN: ${{ secrets.EXEDEV_API_TOKEN }}
+          FACTORY_VM: ${{ vars.FACTORY_VM }}
+        run: |
+          curl -sS -X POST https://exe.dev/exec \
+            -H "Authorization: Bearer $EXEDEV_API_TOKEN" \
+            --data-urlencode "ssh $FACTORY_VM ~/factory/run.sh review-and-fix ${{ github.event.pull_request.number }}"

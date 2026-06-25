@@ -1,0 +1,23 @@
+name: Implement Ready Issues
+
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: factory-implement-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    if: github.event.label.name == 'ready'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger factory worker
+        env:
+          EXEDEV_API_TOKEN: ${{ secrets.EXEDEV_API_TOKEN }}
+          FACTORY_VM: ${{ vars.FACTORY_VM }}
+        run: |
+          curl -sS -X POST https://exe.dev/exec \
+            -H "Authorization: Bearer $EXEDEV_API_TOKEN" \
+            --data-urlencode "ssh $FACTORY_VM ~/factory/run.sh implement ${{ github.event.issue.number }}"

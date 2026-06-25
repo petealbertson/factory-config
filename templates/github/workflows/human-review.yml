@@ -1,0 +1,19 @@
+name: Human Review (smoke test)
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  serve:
+    if: github.event.label.name == 'human-review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start app server on the worker VM
+        env:
+          EXEDEV_API_TOKEN: ${{ secrets.EXEDEV_API_TOKEN }}
+          FACTORY_VM: ${{ vars.FACTORY_VM }}
+        run: |
+          curl -sS -X POST https://exe.dev/exec \
+            -H "Authorization: Bearer $EXEDEV_API_TOKEN" \
+            --data-urlencode "ssh $FACTORY_VM ~/factory/run.sh human-review ${{ github.event.pull_request.number }}"
