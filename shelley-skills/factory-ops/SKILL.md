@@ -13,8 +13,14 @@ Manage the configuration of the cloud factory. The factory runs on per-repo exe.
 - `~/factory/models.env` — role→model bindings (`IMPLEMENT_MODEL`, `REVIEW_MODEL`, `FIX_MODEL`). **The file you edit to swap models.**
 - `~/.pi/agent/models.json` — provider/model registry. Edit when adding a provider.
 - `~/.pi/agent/auth.json` — provider credentials. **Never edit by hand, never read aloud, never echo.**
-- `~/factory/repo.env` — which repo this VM runs. Per-VM, not in git.
-- `~/factory/.agents/skills/{implementation,review}/SKILL.md` — the factory skills.
+- `~/factory/repo.env` — which repo this VM runs. Per-VM, not in git. Written by `factory-install`.
+- `~/factory/.agents/skills/{implementation,review}/SKILL.md` — the factory skills (used by `run.sh`).
+- `~/actions-runner/` + `gh-actions-runner.service` — the self-hosted runner. Pre-baked on the template (disabled); enabled/registered by `factory-install`.
+
+## Sibling skills
+
+- `factory-install` — bind a fresh VM to a repo (register runner, write repo.env, workflows, labels). Per-repo bootstrap. This skill does NOT overlap.
+- `rails-exe-setup` — clone + deps + PG + dev server. Dev-environment bootstrap. Run before `factory-install` for a Rails repo.
 
 ## Inference plane rule
 
@@ -41,14 +47,17 @@ User says "add Codex" / "add a provider, I have an API key".
 3. **Credentials**: the user must run `pi` → `/login` → select provider → paste key **at a terminal**, never in this chat. Tell them the exact command. Do not offer to run it for them. Do not ask to see the key.
 4. To propagate to existing repo VMs without re-login: plan a refresh-from-template (below). Otherwise the user logs in on each VM.
 
-### Refresh a repo VM from template (when idle)
+### Refresh a repo VM from template (the monthly flow)
 
-For bringing fresh keys/config to a repo VM without per-VM `/login`.
+For bringing fresh keys/config/tooling to a repo VM without per-VM `/login`.
 
 1. Confirm the repo VM is idle: `ssh <vm> "ls ~/factory/servers/*.pid 2>/dev/null"` and check for open PRs (`gh pr list --repo <slug> --state open`). If anything is active, STOP and tell the user.
-2. `ssh exe.dev cp rails-vm-template <new-vm>`
-3. Re-attach the repo's GitHub integration, re-clone the repo, run the DB template build (`~/factory/run.sh` has no command for this yet — run `bundle exec rails db:migrate` against the template DB).
-4. Swap the `factory` tag to the new VM; retire the old one after the user confirms.
+2. `ssh exe.dev cp rails-vm-template <new-vm>` (destroys and recreates the VM).
+3. On the new VM, tell Shelley (or Pi): run `rails-exe-setup` then `factory-install` for `<slug>`. Both are idempotent; `factory-install` re-registers the runner with `--replace` and rewrites `repo.env`.
+4. Confirm with `gh api repos/<slug>/actions/runners --jq '.runners[] | {name,state}'` — runner `online`.
+5. Retire the old VM after the user confirms.
+
+Provider keys live in the template's `auth.json` and ride along on `cp` — no per-VM `/login`.
 
 ### List / status
 
