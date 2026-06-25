@@ -19,8 +19,10 @@ command -v gh >/dev/null || { echo "gh CLI required" >&2; exit 1; }
 if [ ! -s "$TOKEN_FILE" ]; then
   cat >&2 <<EOF
 No token at $TOKEN_FILE.
-Generate one on your laptop (where your exe.dev SSH key is):
-  ssh exe.dev ssh-key generate-api-key --label=factory-ci --exp=365d
+Generate one on your laptop (where your exe.dev SSH key is).
+Note: the factory needs the `ssh` command, which is NOT in the default token
+perms, so you MUST pass --cmds=ssh:
+  ssh exe.dev ssh-key generate-api-key --label=factory-ci --exp=365d --cmds=ssh
 Then create the file on this VM and paste the exe1.... key into it:
   mkdir -p $(dirname "$TOKEN_FILE") && chmod 700 $(dirname "$TOKEN_FILE")
   # paste the key into: $TOKEN_FILE
