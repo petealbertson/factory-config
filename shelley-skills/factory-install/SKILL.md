@@ -28,8 +28,17 @@ already on the VM — **never ask the user for a token or a GitHub secret.**
   Rails app. This skill does NOT clone the app repo — `repo.env` points at an
   existing checkout.
 - `~/factory` present (clones itself if missing).
-- `~/actions-runner/run.sh` present (the binary). Bail with a clear message if
-  not — that's a template-bake problem, not something to fix here.
+- `~/actions-runner/run.sh` present (the binary). If missing (template didn't
+  bake it), auto-fetch the latest `actions/runner` linux-x64 release:
+  ```bash
+  if [ ! -x ~/actions-runner/run.sh ]; then
+    mkdir -p ~/actions-runner && cd ~/actions-runner
+    url=$(gh api repos/actions/runner/releases/latest --jq \
+      '.assets[] | select(.name|test("linux-x64-[0-9].*\\.tar.gz")) | .browser_download_url')
+    curl -sL "$url" | tar xz
+    test -x run.sh
+  fi
+  ```
 - **`gh` >= 2.60.** Older `gh` (e.g. the 2.45.0 shipped on Ubuntu Noble) hits a
   hard error on any human-format `gh pr` call:
   `GraphQL: Projects (classic) is being deprecated ... (repository.pullRequest.projectCards)`.
