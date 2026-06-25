@@ -31,11 +31,7 @@ else
   echo "$FACTORY_DIR/repo.env already exists, leaving it"
 fi
 
-cat <<NOTE
-
-Next steps:
-  1. Set repository variable  FACTORY_VM  (Settings > Secrets and variables > Actions > Variables)
-  2. Set repository secret   EXEDEV_API_TOKEN  (generate on a VM: ssh exe.dev ssh-key generate-api-key --exp=365d)
-  3. Create the labels: ready, human-review  (GitHub issues/PR labels)
-  4. Commit and push the workflows.
-NOTE
+echo
+echo "Installed. Remaining steps (run from the repo VM):"
+echo "  git add .github/workflows && git commit -m 'factory workflows' && git push"
+echo "  bash ~/factory/scripts/setup-repo.sh $REPO_SLUG <factory-vm-name>"
