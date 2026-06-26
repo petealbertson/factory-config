@@ -137,6 +137,33 @@ run_pi() {
   pi --model "$model" -p "$prompt"
 }
 
+# The shared review-rules fragment, read by every review skill (specialists,
+# coordinator, and the trivial single pass). Centralized so the emission bar,
+# scope discipline, and FINDINGS output format are defined once.
+review_shared_file() { printf '%s/.agents/skills/review-shared.md\n' "$FACTORY_DIR"; }
+
+# Resolve a skill's SKILL.md path (factory dir first, then repo-local).
+review_skill_file() {
+  local skill="$1"
+  local f="$FACTORY_DIR/.agents/skills/$skill/SKILL.md"
+  [ -f "$f" ] || f="$REPO_DIR/.agents/skills/$skill/SKILL.md"
+  printf '%s\n' "$f"
+}
+
+# Run one review agent headlessly, tool-free, with all inputs inlined via
+# pi's @file expansion. `@file` only expands for command-line args (NOT for
+# files the agent reads via its read tool), so callers MUST pass everything
+# here. --no-tools because the complete context is inlined; roaming the repo
+# just wastes tokens (same lesson as the OpenCode version).
+#
+# Args: $1=skill, $2=model, $3=cwd, then varargs of @file paths + trailing prompt.
+run_review_agent() {
+  local skill="$1" model="$2" cwd="$3"; shift 3
+  log "pi-review: skill=$skill model=$model cwd=$cwd"
+  cd "$cwd"
+  pi --no-tools --model "$model" "$@"
+}
+
 # ---------------------------------------------------------------- kind: implement
 
 kind_implement() {
@@ -167,8 +194,14 @@ kind_implement() {
 }
 
 # ----------------------------------------------------------------- kind: review
-# One review pass. 0 findings OR round==MAX -> needs-human-review; else save
-# findings and label fixes-requested.
+# One review pass, multi-perspective. Trivial PR (≤10 lines, no security-
+# sensitive paths) -> single reviewer pass. Otherwise: fan out the four
+# specialists in parallel, then a coordinator pass dedupes/filters/renumbers
+# their outputs into one canonical FINDINGS block.
+#
+# 0 findings OR round==MAX -> needs-human-review; else save findings and label
+# fixes-requested. The output contract (FINDINGS: block, ^F[0-9] counted) is
+# unchanged from the single-reviewer design; only how findings are produced.
 kind_review() {
   local pr="$1"
   local branch; branch="$(gh pr view "$pr" --repo "$REPO_SLUG" --json headRefName -q .headRefName)"
@@ -179,13 +212,33 @@ kind_review() {
   echo "$round" > "$rfile"
 
   log "review round $round/$MAX_ROUNDS on PR #$pr ($branch)"
-  local findings; findings="$(run_pi review "$REVIEW_MODEL" "$dir" \
-    "Review PR #$pr in $REPO_SLUG (branch $branch). Read $FACTORY_DIR/.agents/skills/review/SKILL.md and follow it exactly. Output ONLY the findings block as specified by the skill. This is review round $round of at most $MAX_ROUNDS.")"
+
+  # --- fetch diff ONCE; build a per-run workdir for inlined inputs/outputs ---
+  local workdir; workdir="$(mktemp -d)"
+  local diff_file="$workdir/diff"
+  gh pr diff "$pr" --repo "$REPO_SLUG" > "$diff_file" 2>/dev/null || cp /dev/null "$diff_file"
+  local tier; tier="$(classify_tier "$diff_file")"
+  log "risk tier: $tier"
+
+  local findings perspectives
+  if [ "$tier" = "trivial" ]; then
+    findings="$(run_review_agent review "$REVIEW_MODEL" "$dir" \
+      "@$(review_shared_file)" "@$(review_skill_file review)" "@$diff_file" \
+      "You are reviewing PR #$pr in $REPO_SLUG (branch $branch). Follow the instructions inlined above. Output ONLY the findings block. This is review round $round of at most $MAX_ROUNDS.")"
+    perspectives="single pass"
+  else
+    findings="$(run_multi_perspective "$workdir" "$diff_file" "$pr" "$branch" "$round" "$dir")"
+    perspectives="security · quality · performance · docs → coordinator"
+  fi
+
+  # best-effort cleanup of the per-run workdir
+  rm -rf "$workdir" 2>/dev/null || true
+
   local count; count="$(printf '%s' "$findings" | grep -c '^F[0-9]' || true)"
   log "round $round: $count finding(s)"
 
   if [ "$count" -eq 0 ]; then
-    gh pr comment "$pr" --repo "$REPO_SLUG" --body "✅ **Approved** — review found no blocking issues (round $round of $MAX_ROUNDS). Ready for human review."
+    gh pr comment "$pr" --repo "$REPO_SLUG" --body "✅ **Approved** — review found no blocking issues (round $round of $MAX_ROUNDS, $perspectives). Ready for human review."
     transition_label "$pr" "ready-for-review" "needs-human-review"
     return 0
   fi
@@ -194,17 +247,79 @@ kind_review() {
   printf '%s\n' "$findings" > "$(findings_file "$pr")"
 
   if [ "$round" -ge "$MAX_ROUNDS" ]; then
-    gh pr comment "$pr" --repo "$REPO_SLUG" --body "⚠️ **Did not converge** after $MAX_ROUNDS review rounds ($count finding(s) still open). Needs human input. Latest findings:
+    gh pr comment "$pr" --repo "$REPO_SLUG" --body "⚠️ **Did not converge** after $MAX_ROUNDS review rounds ($count finding(s) still open, $perspectives). Needs human input. Latest findings:
 
 $findings"
     transition_label "$pr" "ready-for-review" "needs-human-review"
     return 0
   fi
 
-  gh pr comment "$pr" --repo "$REPO_SLUG" --body "🔍 Review round $round: $count finding(s). Requesting fixes.
+  gh pr comment "$pr" --repo "$REPO_SLUG" --body "🔍 Review round $round: $count finding(s) ($perspectives). Requesting fixes.
 
 $findings"
   transition_label "$pr" "ready-for-review" "fixes-requested"
+}
+
+# Classify a PR's risk tier from its diff: trivial | full. Two tiers only.
+#   trivial = ≤10 changed lines AND ≤5 files AND no security-sensitive paths
+#   full    = everything else (the fan-out + coordinator path)
+# Security-sensitive paths always force full review regardless of size.
+TRIVIAL_MAX_LINES=10
+TRIVIAL_MAX_FILES=5
+SECURITY_PATHS_RE='(auth/|crypto/|certificate|secret|credential|password|jwt|token|session|rbac|permission)'
+classify_tier() {
+  local diff_file="$1"
+  # count changed files (diff --git headers). `grep -c` prints 0 on no-match,
+  # so `|| true` (NOT `|| echo 0`) avoids appending a second 0 that breaks `[ -le ]`.
+  local files; files="$(grep -c '^diff --git' "$diff_file" 2>/dev/null || true)"
+  # count added+removed lines (start with + or -, but not +++/--- headers)
+  local lines; lines="$(grep -E '^[+-]' "$diff_file" 2>/dev/null | grep -cvE '^(\+\+\+|---)' || true)"
+  if grep -Eiq "$SECURITY_PATHS_RE" "$diff_file"; then echo full; return; fi
+  if [ "$lines" -le "$TRIVIAL_MAX_LINES" ] && [ "$files" -le "$TRIVIAL_MAX_FILES" ]; then
+    echo trivial
+  else
+    echo full
+  fi
+}
+
+# Fan out the four specialists in parallel, then run the coordinator over
+# their outputs. All inputs inlined via @file; every agent runs --no-tools.
+# A specialist that errors/times out contributes an empty file and is simply
+# absent from the coordinator's inputs — the review proceeds on the rest.
+# Args: $1=workdir $2=diff_file $3=pr $4=branch $5=round $6=cwd
+run_multi_perspective() {
+  local workdir="$1" diff_file="$2" pr="$3" branch="$4" round="$5" cwd="$6"
+  local shared; shared="$(review_shared_file)"
+  local spec_prompt="You are a specialist reviewer on PR #$pr in $REPO_SLUG (branch $branch), review round $round of at most $MAX_ROUNDS. Follow the instructions inlined above. Output ONLY your findings block."
+  local sec="$workdir/out.security" qual="$workdir/out.quality" perf="$workdir/out.performance" docs="$workdir/out.docs"
+
+  log "fanning out specialists: security quality performance docs"
+  # Each in a subshell so a failure (set -e) cannot abort the parent. Outputs to
+  # files; an empty file = that specialist contributed nothing.
+  ( run_review_agent review-security  "$REVIEW_SECURITY_MODEL"    "$cwd" \
+      "@$shared" "@$(review_skill_file review-security)"  "@$diff_file" "$spec_prompt" > "$sec"  2>/dev/null ) &
+  ( run_review_agent review-quality   "$REVIEW_QUALITY_MODEL"     "$cwd" \
+      "@$shared" "@$(review_skill_file review-quality)"   "@$diff_file" "$spec_prompt" > "$qual" 2>/dev/null ) &
+  ( run_review_agent review-performance "$REVIEW_PERFORMANCE_MODEL" "$cwd" \
+      "@$shared" "@$(review_skill_file review-performance)" "@$diff_file" "$spec_prompt" > "$perf" 2>/dev/null ) &
+  ( run_review_agent review-docs      "$REVIEW_DOCS_MODEL"        "$cwd" \
+      "@$shared" "@$(review_skill_file review-docs)"      "@$diff_file" "$spec_prompt" > "$docs" 2>/dev/null ) &
+  wait
+
+  local ran=""
+  [ -s "$sec"  ] && ran+="security "
+  [ -s "$qual" ] && ran+="quality "
+  [ -s "$perf" ] && ran+="performance "
+  [ -s "$docs" ] && ran+="docs"
+  log "specialists produced output: ${ran:-none}"
+
+  # Coordinator: shared rules + its skill + the diff + each specialist output.
+  # Note: no quotes around ${x:+@$x} — pi needs the @file as a bare arg; quoting
+  # embeds the quote chars and breaks @file parsing (EISDIR / treat-as-prompt).
+  run_review_agent review-coordinator "$REVIEW_MODEL" "$cwd" \
+    "@$shared" "@$(review_skill_file review-coordinator)" "@$diff_file" \
+    ${sec:+@$sec} ${qual:+@$qual} ${perf:+@$perf} ${docs:+@$docs} \
+    "You are the review coordinator for PR #$pr in $REPO_SLUG (branch $branch), round $round of at most $MAX_ROUNDS. The inlined sections above are: shared rules, your coordinator instructions, the diff, then each specialist's findings. Deduplicate, filter, renumber, and emit exactly one canonical findings block."
 }
 
 # -------------------------------------------------------------------- kind: fix
