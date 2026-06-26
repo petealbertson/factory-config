@@ -73,6 +73,63 @@ log() { printf '\033[1;34m[factory]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[factory error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 sanitize() { echo "$1" | tr -c 'a-zA-Z0-9' '_' | tr 'A-Z' 'a-z'; }
+json_escape() { printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])'; }
+
+# --------------------------------------------------------------------- control-plane
+# Callbacks are optional; when FACTORY_APP_URL + FACTORY_RUN_ID are unset the
+# runner keeps working in legacy label-driven mode. The callback token is only
+# needed when posting back to the control plane.
+factory_callback_base_url() {
+  if [ -n "${FACTORY_APP_URL:-}" ] && [ -n "${FACTORY_RUN_ID:-}" ] && [[ "$FACTORY_RUN_ID" =~ ^[0-9]+$ ]]; then
+    printf '%s/internal/runs/%s' "${FACTORY_APP_URL%/}" "$FACTORY_RUN_ID"
+  fi
+}
+factory_auth_header() {
+  if [ -n "${FACTORY_CALLBACK_TOKEN:-}" ]; then
+    printf 'Authorization: Bearer %s' "$FACTORY_CALLBACK_TOKEN"
+  fi
+}
+factory_emit_dashboard_link() {
+  if [ -z "${FACTORY_APP_URL:-}" ] || [ -z "${FACTORY_RUN_ID:-}" ]; then
+    return 0
+  fi
+  local url; url="${FACTORY_APP_URL%/}/runs/${FACTORY_RUN_ID}"
+  log "dashboard: $url"
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "::notice title=Factory run::$url"
+  fi
+}
+factory_post() {
+  local path="$1" payload="$2"
+  local base; base="$(factory_callback_base_url)"
+  local auth; auth="$(factory_auth_header)"
+  [ -n "$base" ] || return 0
+  [ -n "$auth" ] || return 0
+  local url="$base/$path"
+  curl -fsS -X POST -H "$auth" -H "Content-Type: application/json" -d "$payload" "$url" >/dev/null 2>&1 || true
+}
+factory_heartbeat() {
+  local step="${1:-}"
+  local payload; payload='{}'
+  [ -n "$step" ] && payload="{\"current_step\":\"$(json_escape "$step")\"}"
+  factory_post "heartbeat" "$payload"
+}
+factory_event() {
+  local event_type="$1"; shift || true
+  local message="${1:-}"; shift || true
+  local external_url="${1:-}"
+  local url_field=""
+  [ -n "$external_url" ] && url_field=",\"external_url\":\"$(json_escape "$external_url")\""
+  local payload; payload="{\"event_type\":\"$(json_escape "$event_type")\",\"message\":\"$(json_escape "$message")\"$url_field}"
+  factory_post "events" "$payload"
+}
+factory_complete() {
+  local state="$1"; shift || true
+  local message="${1:-}"
+  local payload; payload="{\"state\":\"$state\",\"message\":\"$(json_escape "$message")\"}"
+  factory_post "complete" "$payload"
+}
+factory_fail() { factory_complete "failed" "$1"; }
 
 # worktree dir for a branch
 wt_dir() { printf '%s/../%s-%s\n' "$REPO_DIR" "$REPO_BASE" "$(sanitize "$1")"; }
@@ -185,6 +242,8 @@ run_review_agent() {
 # so a REFINE-free issue reaches implementation in one workflow run.
 kind_triage() {
   local issue="$1"
+  factory_emit_dashboard_link
+  factory_heartbeat "triage"
   log "triage: issue #$issue in $REPO_SLUG"
 
   # Fetch the issue body and its comments into a workdir file. The triage agent
@@ -225,6 +284,7 @@ kind_triage() {
   ')" in
     refine)
       log "triage: issue #$issue REFINE — posting blockers, transitioning to needs-refinement"
+      factory_event "triage_refined" "refinements requested"
       gh issue comment "$issue" --repo "$REPO_SLUG" --body "🟠 **Needs refinement before implementation.** The triage agent found gaps that would force an implementer to guess:
 
 $decision
@@ -233,10 +293,12 @@ Please address the blockers above, then remove the \`needs-refinement\` label an
       # transition_label works on PR labels; for an issue use gh issue edit.
       gh issue edit "$issue" --repo "$REPO_SLUG" --remove-label "ready-for-implementation" 2>/dev/null || true
       gh issue edit "$issue" --repo "$REPO_SLUG" --add-label "needs-refinement"
+      factory_complete "factory_stopped" "needs refinement"
       return 0
       ;;
     *)
       log "triage: issue #$issue PROCEED — chaining to implement"
+      factory_event "triage_started" "proceeding to implement"
       kind_implement "$issue"
       ;;
   esac
@@ -246,6 +308,8 @@ Please address the blockers above, then remove the \`needs-refinement\` label an
 
 kind_implement() {
   local issue="$1"
+  factory_heartbeat "implement"
+  factory_event "implementation_started" "issue #$issue"
   local branch="fix/$issue"
   local dir; dir="$(wt_dir "$branch")"
 
@@ -264,6 +328,8 @@ kind_implement() {
   # the agent opened the PR; find it and transition into the review loop.
   local pr; pr="$(gh pr list --repo "$REPO_SLUG" --head "$branch" --state open --json number -q '.[0].number' 2>/dev/null || echo "")"
   [ -n "$pr" ] || die "implement finished but no open PR found on branch $branch; leaving issue labeled"
+  local pr_url; pr_url="$(gh pr view "$pr" --repo "$REPO_SLUG" --json url -q .url 2>/dev/null || echo "")"
+  factory_event "implementation_pr_created" "PR #$pr" "${pr_url}"
   mkdir -p "$(state_dir)"
   echo 0 > "$(round_file "$pr")"   # review will increment to 1 on first pass
   log "PR #$pr opened; transitioning issue -> review"
@@ -282,6 +348,8 @@ kind_implement() {
 # unchanged from the single-reviewer design; only how findings are produced.
 kind_review() {
   local pr="$1"
+  factory_heartbeat "review"
+  factory_event "review_started" "PR #$pr"
   local branch; branch="$(gh pr view "$pr" --repo "$REPO_SLUG" --json headRefName -q .headRefName)"
   local dir; dir="$(ensure_pr_stage "$branch")"
   mkdir -p "$(state_dir)"
@@ -314,10 +382,12 @@ kind_review() {
 
   local count; count="$(printf '%s' "$findings" | grep -c '^F[0-9]' || true)"
   log "round $round: $count finding(s)"
+  factory_event "review_findings_posted" "round $round: $count finding(s)"
 
   if [ "$count" -eq 0 ]; then
     gh pr comment "$pr" --repo "$REPO_SLUG" --body "✅ **Approved** — review found no blocking issues (round $round of $MAX_ROUNDS, $perspectives). Ready for human review."
     transition_label "$pr" "ready-for-review" "needs-human-review"
+    factory_complete "factory_stopped" "needs human review"
     return 0
   fi
 
@@ -329,6 +399,7 @@ kind_review() {
 
 $findings"
     transition_label "$pr" "ready-for-review" "needs-human-review"
+    factory_complete "factory_stopped" "needs human review after max rounds"
     return 0
   fi
 
@@ -405,6 +476,8 @@ run_multi_perspective() {
 # ready-for-review, which fires the next review.
 kind_fix() {
   local pr="$1"
+  factory_heartbeat "fix"
+  factory_event "fix_started" "PR #$pr"
   local branch; branch="$(gh pr view "$pr" --repo "$REPO_SLUG" --json headRefName -q .headRefName)"
   local dir; dir="$(ensure_pr_stage "$branch")"
   local ffile; ffile="$(findings_file "$pr")"
@@ -417,6 +490,7 @@ kind_fix() {
 
 $findings" >/dev/null
 
+  factory_event "fix_pushed" "PR #$pr"
   transition_label "$pr" "fixes-requested" "ready-for-review"
 }
 
@@ -425,6 +499,8 @@ $findings" >/dev/null
 # wipe this PR's state.
 kind_teardown() {
   local pr="$1"
+  factory_heartbeat "teardown"
+  factory_event "teardown_started" "PR #$pr"
   local branch; branch="$(gh pr view "$pr" --repo "$REPO_SLUG" --json headRefName -q .headRefName 2>/dev/null || echo "")"
   if [ -n "$branch" ]; then
     local dir; dir="$(wt_dir "$branch")"
@@ -441,6 +517,7 @@ kind_teardown() {
   log "syncing $REPO_DIR -> $GIT_BRANCH_MAIN"
   git -C "$REPO_DIR" checkout "$GIT_BRANCH_MAIN" 2>/dev/null || true
   git -C "$REPO_DIR" pull --ff-only 2>/dev/null && log "pulled latest $GIT_BRANCH_MAIN" || true
+  factory_event "teardown_completed" "PR #$pr"
 }
 
 # ------------------------------------------------------------------------ main
