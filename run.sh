@@ -73,14 +73,14 @@ log() { printf '\033[1;34m[factory]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[factory error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 sanitize() { echo "$1" | tr -c 'a-zA-Z0-9' '_' | tr 'A-Z' 'a-z'; }
-json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g; s/\r/\\r/g; s/\t/\\t/g'; }
+json_escape() { printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])'; }
 
 # --------------------------------------------------------------------- control-plane
 # Callbacks are optional; when FACTORY_APP_URL + FACTORY_RUN_ID are unset the
 # runner keeps working in legacy label-driven mode. The callback token is only
 # needed when posting back to the control plane.
 factory_callback_base_url() {
-  if [ -n "${FACTORY_APP_URL:-}" ] && [ -n "${FACTORY_RUN_ID:-}" ]; then
+  if [ -n "${FACTORY_APP_URL:-}" ] && [ -n "${FACTORY_RUN_ID:-}" ] && [[ "$FACTORY_RUN_ID" =~ ^[0-9]+$ ]]; then
     printf '%s/internal/runs/%s' "${FACTORY_APP_URL%/}" "$FACTORY_RUN_ID"
   fi
 }
@@ -102,14 +102,11 @@ factory_emit_dashboard_link() {
 factory_post() {
   local path="$1" payload="$2"
   local base; base="$(factory_callback_base_url)"
-  [ -n "$base" ] || return 0
   local auth; auth="$(factory_auth_header)"
+  [ -n "$base" ] || return 0
+  [ -n "$auth" ] || return 0
   local url="$base/$path"
-  if [ -n "$auth" ]; then
-    curl -fsS -X POST -H "$auth" -H "Content-Type: application/json" -d "$payload" "$url" >/dev/null 2>&1 || true
-  else
-    curl -fsS -X POST -H "Content-Type: application/json" -d "$payload" "$url" >/dev/null 2>&1 || true
-  fi
+  curl -fsS -X POST -H "$auth" -H "Content-Type: application/json" -d "$payload" "$url" >/dev/null 2>&1 || true
 }
 factory_heartbeat() {
   local step="${1:-}"
@@ -123,7 +120,7 @@ factory_event() {
   local external_url="${1:-}"
   local url_field=""
   [ -n "$external_url" ] && url_field=",\"external_url\":\"$(json_escape "$external_url")\""
-  local payload; payload="{\"event_type\":\"$event_type\",\"message\":\"$(json_escape "$message")\"$url_field}"
+  local payload; payload="{\"event_type\":\"$(json_escape "$event_type")\",\"message\":\"$(json_escape "$message")\"$url_field}"
   factory_post "events" "$payload"
 }
 factory_complete() {
