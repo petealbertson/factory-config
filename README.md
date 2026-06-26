@@ -16,7 +16,9 @@ time, transitions drive the next step. No review fires on push; only at
 explicit state transitions.
 
 ```
-issue: ready-for-implementation ──► run.sh implement ──► PR: ready-for-review
+issue: ready-for-implementation ──► run.sh triage
+  ├─ PROCEED  ──► run.sh implement ──► PR: ready-for-review
+  └─ REFINE   ──► needs-refinement  (terminal; human sharpens, re-labels)
 PR: ready-for-review             ──► run.sh review
   ├─ 0 findings (or round 3)     ──► needs-human-review  (terminal)
   └─ findings + round < 3        ──► fixes-requested ──► run.sh fix ──► ready-for-review
@@ -25,14 +27,16 @@ PR closed                        ──► run.sh teardown
 
 Pull up any PR and its single state label tells you where it is. Bounded at 3
 review passes (initial + 2 fix rounds); if it can't converge, it lands on
-`needs-human-review` with the last findings instead of looping.
+`needs-human-review` with the last findings instead of looping. An issue that
+isn't defined enough to act on lands on `needs-refinement` with the specific
+gaps before any implementation cycles are spent on it.
 
 ## What's here
 
 | Path | Purpose |
 |---|---|
-| `run.sh` | The runner. Subcommands: `implement`, `review`, `fix`, `teardown`. |
-| `.agents/skills/` | The `implementation` and `review` Pi skills (used by `run.sh`). |
+| `run.sh` | The runner. Subcommands: `triage`, `implement`, `review`, `fix`, `teardown`. |
+| `.agents/skills/` | The `triage`, `implementation`, and `review` Pi skills (used by `run.sh`). |
 | `models.env` | Role → model bindings. Edit + commit + fan out to swap models. |
 | `templates/github/workflows/` | The four Actions, copied into consuming repos. |
 | `shelley-skills/factory-install/` | Skill: bind a fresh VM to a repo (register runner, write repo.env, ensure workflows/labels). |
@@ -70,7 +74,9 @@ ssh exe.dev cp rails-vm-template new-app-vm
 > use `rails-exe-setup` for `petealbertson/new-app`
 > then use `factory-install` for `petealbertson/new-app`
 
-Label an issue `ready-for-implementation`. It fires end-to-end.
+Label an issue `ready-for-implementation`. It fires end-to-end: triage checks
+the issue is defined enough, then implement opens the PR and the review loop
+runs. If the issue is vague, it lands on `needs-refinement` first instead.
 
 ## Refresh a repo VM (the monthly flow)
 
@@ -87,11 +93,15 @@ the app checkout, unaffected.
 
 ```
 plan (interactive) → issue → label 'ready-for-implementation'
-  → implement → PR: ready-for-review
+  → triage → PROCEED → implement → PR: ready-for-review
   → review → fixes-requested → fix → ready-for-review  (max 3 reviews)
   → needs-human-review → you smoke-test on the VM → you merge
   → teardown (PR closed: worktree + DB + branch gone, main synced)
 ```
+
+If triage emits REFINE, the issue lands on `needs-refinement` with the specific
+gaps; no implementation cycles are spent until a human sharpens it and
+re-labels `ready-for-implementation`.
 
 ## Inference
 

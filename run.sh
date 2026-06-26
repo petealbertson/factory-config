@@ -8,12 +8,15 @@
 #
 # Subcommands (each is one step in the loop; the loop is driven by GitHub label
 # events, NOT by push):
+#   triage <issue>      gate before implement: is the issue defined enough? PROCEED -> implement, REFINE -> needs-refinement
 #   implement <issue>   implement a ready-for-implementation issue; open PR; label it ready-for-review
 #   review <pr>         one review pass; 0 findings -> needs-human-review, else fixes-requested (or needs-human-review at round 3)
 #   fix <pr>            one fix pass from saved findings; re-label ready-for-review
 #   teardown <pr>       on PR close: remove worktree, drop DB, delete branch, sync main, wipe state
 #
-# State machine (one state label on the PR at a time):
+# State machine (one state label on the PR/issue at a time):
+#   issue: ready-for-implementation -> [triage] -> implement  (PROCEED)
+#                                           └──> needs-refinement  (REFINE; human sharpens, re-labels ready-for-implementation)
 #   issue: ready-for-implementation -> [implement] -> PR: ready-for-review
 #   PR: ready-for-review -> [review] -> fixes-requested -> [fix] -> ready-for-review  (loop, max 3 reviews)
 #                                    -> [review, 0 findings OR round 3] -> needs-human-review (terminal)
@@ -150,6 +153,14 @@ review_skill_file() {
   printf '%s\n' "$f"
 }
 
+# Same resolution, named for the triage skill (kept separate from
+# review_skill_file for clarity even though the logic is identical).
+triage_skill_file() {
+  local f="$FACTORY_DIR/.agents/skills/triage/SKILL.md"
+  [ -f "$f" ] || f="$REPO_DIR/.agents/skills/triage/SKILL.md"
+  printf '%s\n' "$f"
+}
+
 # Run one review agent headlessly, tool-free, with all inputs inlined via
 # pi's @file expansion. `@file` only expands for command-line args (NOT for
 # files the agent reads via its read tool), so callers MUST pass everything
@@ -162,6 +173,73 @@ run_review_agent() {
   log "pi-review: skill=$skill model=$model cwd=$cwd"
   cd "$cwd"
   pi --no-tools --model "$model" "$@"
+}
+
+# ---------------------------------------------------------------- kind: triage
+# Gate before implementation. Tool-free single pass over the issue body (+
+# comments): does the implementer have enough to act without guessing?
+#   DECISION: PROCEED  -> chain into kind_implement on the same invocation
+#   DECISION: REFINE   -> post the blockers as an issue comment and transition
+#                         the issue ready-for-implementation -> needs-refinement.
+# Runs under set -euo pipefail; kind_implement is invoked in-process (no subshell)
+# so a REFINE-free issue reaches implementation in one workflow run.
+kind_triage() {
+  local issue="$1"
+  log "triage: issue #$issue in $REPO_SLUG"
+
+  # Fetch the issue body and its comments into a workdir file. The triage agent
+  # is --no-tools, so everything it sees must be inlined via @file. One JSON call
+  # gives title + body + all comments cleanly (no double-fetch, no UI chrome).
+  local workdir; workdir="$(mktemp -d)"
+  local issue_file="$workdir/issue.md"
+  gh issue view "$issue" --repo "$REPO_SLUG" --json title,body,comments \
+    -q '"# " + .title + "\n\n" + .body + 
+         (if (.comments|length) > 0 
+          then "\n\n---\n## Comments\n" +
+            ([.comments[] | "**" + (.author.login // "unknown") + ":**\n" + .body] | join("\n\n"))
+          else "" end)' \
+    > "$issue_file" 2>/dev/null \
+    || die "could not fetch issue #$issue from $REPO_SLUG"
+  [ -s "$issue_file" ] || die "issue #$issue fetched empty; aborting triage"
+
+  local decision
+  decision="$(run_review_agent triage "$TRIAGE_MODEL" "$REPO_DIR" \
+    "@$(triage_skill_file)" "@$issue_file" \
+    "You are triaging issue #$issue in $REPO_SLUG to decide whether it is ready for an implementer agent. The issue (title, body, comments) is inlined above, followed by your instructions. Decide PROCEED or REFINE and output ONLY the decision block.")"
+  rm -rf "$workdir" 2>/dev/null || true
+
+  # The agent's contract: a line starting 'DECISION: PROCEED' or 'DECISION: REFINE'.
+  # Tolerate leading whitespace (the model sometimes wraps in a ``` fence) and
+  # case. Default to PROCEED on any parse failure: a malformed agent response
+  # must not block an otherwise-ready issue (false PROCEED is caught downstream
+  # by review; false REFINE wastes a human round-trip nothing recovers).
+  #
+  # NOTE: do NOT use `exit` + `END` here — awk runs END even after exit, so a
+  # matched REFINE would also print the END default, yielding 'refine\nproceed',
+  # which the case statement then fails to match and misparses as PROCEED.
+  # Instead collect into a variable and print once at the end.
+  case "$(printf '%s' "$decision" | awk '
+    toupper($0) ~ /^[[:space:]]*DECISION:[[:space:]]*REFINE/  {d="refine"}
+    toupper($0) ~ /^[[:space:]]*DECISION:[[:space:]]*PROCEED/ {d="proceed"}
+    END {print (d=="") ? "proceed" : d}
+  ')" in
+    refine)
+      log "triage: issue #$issue REFINE — posting blockers, transitioning to needs-refinement"
+      gh issue comment "$issue" --repo "$REPO_SLUG" --body "🟠 **Needs refinement before implementation.** The triage agent found gaps that would force an implementer to guess:
+
+$decision
+
+Please address the blockers above, then remove the \`needs-refinement\` label and re-add \`ready-for-implementation\`."
+      # transition_label works on PR labels; for an issue use gh issue edit.
+      gh issue edit "$issue" --repo "$REPO_SLUG" --remove-label "ready-for-implementation" 2>/dev/null || true
+      gh issue edit "$issue" --repo "$REPO_SLUG" --add-label "needs-refinement"
+      return 0
+      ;;
+    *)
+      log "triage: issue #$issue PROCEED — chaining to implement"
+      kind_implement "$issue"
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------- kind: implement
@@ -369,9 +447,10 @@ kind_teardown() {
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
+  triage)      kind_triage "$@" ;;
   implement)   kind_implement "$@" ;;
   review)      kind_review "$@" ;;
   fix)         kind_fix "$@" ;;
   teardown)    kind_teardown "$@" ;;
-  *) die "unknown subcommand: $cmd (expected: implement|review|fix|teardown)" ;;
+  *) die "unknown subcommand: $cmd (expected: triage|implement|review|fix|teardown)" ;;
 esac

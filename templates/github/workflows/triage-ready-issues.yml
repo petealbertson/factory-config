@@ -1,0 +1,26 @@
+name: Triage Ready Issues
+
+# Fires when an issue is labeled `ready-for-implementation`. run.sh triage
+# reads the issue and decides: PROCEED -> chains straight into implement;
+# REFINE -> posts the blockers and re-labels `needs-refinement` for a human.
+# The implementer never runs against an under-defined issue.
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: factory-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    if: github.event.label.name == 'ready-for-implementation'
+    runs-on: [self-hosted, linux, X64]
+    timeout-minutes: 10
+    steps:
+      - name: Run factory
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          cd ~/factory
+          bash run.sh triage "$ISSUE_NUMBER"

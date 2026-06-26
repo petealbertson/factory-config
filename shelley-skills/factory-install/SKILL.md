@@ -157,18 +157,26 @@ server):
 ```bash
 mkdir -p "$REPO_DIR/.github/workflows"
 cp ~/factory/templates/github/workflows/*.yml "$REPO_DIR/.github/workflows/"
+# remove stale workflows from prior factory designs:
+#  - review-and-fix.yml / human-review.yml: the old push-driven review + smoke
+#    server, replaced by the label-driven state machine.
+#  - implement-ready-issues.yml: the issue workflow now runs triage first, so it
+#    was renamed triage-ready-issues.yml. Both fire on `ready-for-implementation`,
+#    so the old one MUST be removed or two jobs race on the same label.
 rm -f "$REPO_DIR/.github/workflows/review-and-fix.yml" \
-      "$REPO_DIR/.github/workflows/human-review.yml"
+      "$REPO_DIR/.github/workflows/human-review.yml" \
+      "$REPO_DIR/.github/workflows/implement-ready-issues.yml"
 cd "$REPO_DIR"
 if ! git diff --quiet -- .github/workflows 2>/dev/null \
    || [ -n "$(git ls-files --others --exclude-standard -- .github/workflows)" ]; then
-  git add .github/workflows/implement-ready-issues.yml \
+  git add .github/workflows/triage-ready-issues.yml \
           .github/workflows/review.yml \
           .github/workflows/fix.yml \
           .github/workflows/teardown.yml
   git rm --cached .github/workflows/review-and-fix.yml \
-             .github/workflows/human-review.yml 2>/dev/null || true
-  git commit -m "factory: workflows (label-driven state machine)"
+             .github/workflows/human-review.yml \
+             .github/workflows/implement-ready-issues.yml 2>/dev/null || true
+  git commit -m "factory: workflows (triage gate + label-driven state machine)"
   git push
 fi
 ```
@@ -181,7 +189,9 @@ transition). Seed all of them; idempotent (`|| true` — `gh` errors if a label
 exists):
 ```bash
 gh label create ready-for-implementation --repo "$REPO_SLUG" --color 0E8A16 \
-  --description "Issue planned; factory will implement" 2>/dev/null || true
+  --description "Issue planned; factory will triage then implement" 2>/dev/null || true
+gh label create needs-refinement    --repo "$REPO_SLUG" --color BBBBBF \
+  --description "Issue too under-defined to implement; triage sent it back" 2>/dev/null || true
 gh label create ready-for-review     --repo "$REPO_SLUG" --color 1D76DB \
   --description "PR awaiting the reviewer agent" 2>/dev/null || true
 gh label create fixes-requested      --repo "$REPO_SLUG" --color D93F0B \
@@ -189,8 +199,10 @@ gh label create fixes-requested      --repo "$REPO_SLUG" --color D93F0B \
 gh label create needs-human-review   --repo "$REPO_SLUG" --color 5319E7 \
   --description "Agents done (approved or capped); waiting on a human" 2>/dev/null || true
 ```
-Only `ready-for-implementation` (issue) and the three PR labels are trigger
-labels for the workflows; `needs-human-review` is terminal.
+Only `ready-for-implementation` (issue, -> triage) and the three PR labels
+(`ready-for-review`, `fixes-requested`) are trigger labels for the workflows;
+`needs-refinement` and `needs-human-review` are terminal (a human re-labels to
+resume).
 
 ## Step 8 — verify the loop
 
