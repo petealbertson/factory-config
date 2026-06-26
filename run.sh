@@ -148,13 +148,53 @@ factory_authorize_runner() {
     return 0
   fi
 
-  local callback_token
+  local callback_token app_token reviewer_token
   callback_token="$(printf '%s' "$resp" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin).get("callback_token",""))')"
+  app_token="$(printf '%s' "$resp" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin).get("app_token",""))')"
+  reviewer_token="$(printf '%s' "$resp" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin).get("reviewer_token",""))')"
+
   if [ -n "$callback_token" ]; then
     export FACTORY_CALLBACK_TOKEN="$callback_token"
   else
     log "warning: control plane did not return a callback token"
   fi
+  if [ -n "$app_token" ]; then
+    export FACTORY_APP_TOKEN="$app_token"
+  fi
+  if [ -n "$reviewer_token" ]; then
+    export FACTORY_REVIEWER_TOKEN="$reviewer_token"
+  fi
+}
+
+# Configure git user identity for brokered commits under the dispatch path.
+factory_configure_git_identity() {
+  if [ -n "${FACTORY_GIT_AUTHOR_NAME:-}" ]; then
+    git -C "$REPO_DIR" config --local user.name "$FACTORY_GIT_AUTHOR_NAME"
+  fi
+  if [ -n "${FACTORY_GIT_AUTHOR_EMAIL:-}" ]; then
+    git -C "$REPO_DIR" config --local user.email "$FACTORY_GIT_AUTHOR_EMAIL"
+  fi
+}
+
+# Selects the appropriate brokered GitHub App token for the current kind and
+# rewrites the origin remote to use it. Falls back to the VM's ambient gh
+# auth when the control plane did not broker tokens.
+factory_configure_github_token() {
+  local kind="${1:-}"
+  local token=""
+
+  case "$kind" in
+    review)
+      token="${FACTORY_REVIEWER_TOKEN:-$FACTORY_APP_TOKEN}" ;;
+    *)
+      token="${FACTORY_APP_TOKEN:-}" ;;
+  esac
+
+  [ -n "$token" ] || return 0
+
+  export GH_TOKEN="$token"
+  # Rewrite the main repo origin so git push/pull use the brokered token.
+  git -C "$REPO_DIR" remote set-url origin "https://x-access-token:${token}@github.com/${REPO_SLUG}.git" 2>/dev/null || true
 }
 
 # worktree dir for a branch
@@ -553,6 +593,8 @@ kind_teardown() {
 # command path when no FACTORY_RUN_ID is present.
 factory_dispatch_main() {
   factory_authorize_runner
+  factory_configure_git_identity
+  factory_configure_github_token "${FACTORY_KIND:-}"
   factory_emit_dashboard_link
   factory_heartbeat "starting"
 

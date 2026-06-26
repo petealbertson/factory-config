@@ -11,9 +11,22 @@ service. GitHub long-polls the runner directly — no exe.dev API in the path,
 no SSH dispatch, no timeout. Workflows use `runs-on: [self-hosted, linux, X64]`
 and their `run:` steps execute locally, calling `~/factory/run.sh`.
 
+### Legacy label-driven path (default when no control-plane context)
+
 The loop is a **label-driven state machine** — one state label on a PR at a
 time, transitions drive the next step. No review fires on push; only at
 explicit state transitions.
+
+### Control-plane dispatch path (single `workflow_dispatch`)
+
+`factory-app` can now dispatch a run directly via one `workflow_dispatch`
+event on `factory-dispatch.yml`. The workflow passes `FACTORY_RUN_ID`,
+`FACTORY_KIND`, `FACTORY_TARGET`, and a single-use `FACTORY_DISPATCH_TOKEN` to
+`run.sh`. The runner exchanges the dispatch token for a callback token and
+role-specific GitHub App tokens, configures git identity/auth, and runs the
+requested kind. When `FACTORY_RUN_ID`/`FACTORY_KIND` are absent, `run.sh`
+falls back to the legacy label-driven path unchanged.
+
 
 ```
 issue: ready-for-implementation ──► run.sh triage
