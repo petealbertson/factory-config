@@ -69,7 +69,10 @@ jobs:
           FACTORY_MODE: ${{ github.event.inputs.mode }}
           FACTORY_APP_URL: ${{ github.event.inputs.factory_app_url }}
           FACTORY_DISPATCH_TOKEN: ${{ github.event.inputs.dispatch_token }}
+          FACTORY_GIT_AUTHOR_NAME: "Fabrica"
+          FACTORY_GIT_AUTHOR_EMAIL: "fabrica@noreply.github.com"
           GITHUB_ACTIONS: "true"
         run: |
+          echo "::add-mask::${FACTORY_DISPATCH_TOKEN}"
           cd ~/factory
           bash run.sh
