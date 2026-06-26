@@ -8,6 +8,27 @@ Implement a GitHub issue, OR address review findings on an existing branch. Your
 
 You always run inside a git worktree whose working directory is the current process's `$PWD`. The DB is already cloned and named; `config/database.yml` resolves the right one automatically. Do not edit DB config.
 
+## Pace & economy (important)
+
+You have a hard wall-clock budget. Most issues are small and should finish well
+under 15 minutes; behave accordingly. Waste — not difficulty — is what blows
+the budget.
+
+- **Read a file once.** Hold what you read; do not re-read the same file to
+  re-fetch what you already have. If you're unsure, scroll your own context
+  before issuing another read.
+- **Explore narrowly, then commit.** Gather the minimum needed to start — the
+  issue, the directly-affected files, the test command — then implement. Do not
+  read every adjacent file "for context." Targeted > exhaustive.
+- **Validate in batches, not loops.** Run the targeted test once after a change;
+  if it fails, fix and re-run *that test*. Do not re-run the same passing test
+  repeatedly. Run the full suite exactly once, at the end, as the final gate.
+- **Lint once, last.** Run `rubocop`/linters a single time after tests pass, not
+  interleaved with every edit.
+- **Prefer fewer, larger edits** over many tiny re-edits of the same file. Think
+  the change through, write it, move on.
+- **Act, don't deliberate aloud.** Minimal narration. Pick the next step and do it.
+
 ## Inputs
 
 - `REPO_SLUG` (owner/repo) and the issue number are in your prompt.
