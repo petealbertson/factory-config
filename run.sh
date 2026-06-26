@@ -131,6 +131,32 @@ factory_complete() {
 }
 factory_fail() { factory_complete "failed" "$1"; }
 
+# Exchange the single-use dispatch token for the run's callback token.
+# No-op when no dispatch context is present. Callbacks remain disabled if the
+# exchange fails (e.g., the control plane is unreachable), so the runner keeps
+# working in legacy local mode.
+factory_authorize_runner() {
+  local base; base="$(factory_callback_base_url)"
+  [ -n "$base" ] || return 0
+  [ -n "${FACTORY_DISPATCH_TOKEN:-}" ] || return 0
+
+  local url="$base/authorize_runner"
+  local payload; payload="{\"dispatch_token\":\"$(json_escape "$FACTORY_DISPATCH_TOKEN")\"}"
+  local resp
+  if ! resp="$(curl -fsS -X POST -H "Content-Type: application/json" -d "$payload" "$url" 2>/dev/null)"; then
+    log "warning: could not exchange dispatch token; callbacks disabled"
+    return 0
+  fi
+
+  local callback_token
+  callback_token="$(printf '%s' "$resp" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin).get("callback_token",""))')"
+  if [ -n "$callback_token" ]; then
+    export FACTORY_CALLBACK_TOKEN="$callback_token"
+  else
+    log "warning: control plane did not return a callback token"
+  fi
+}
+
 # worktree dir for a branch
 wt_dir() { printf '%s/../%s-%s\n' "$REPO_DIR" "$REPO_BASE" "$(sanitize "$1")"; }
 # db name for a worktree dir (or for "main")
@@ -522,12 +548,58 @@ kind_teardown() {
 
 # ------------------------------------------------------------------------ main
 
-cmd="${1:-}"; shift || true
-case "$cmd" in
-  triage)      kind_triage "$@" ;;
-  implement)   kind_implement "$@" ;;
-  review)      kind_review "$@" ;;
-  fix)         kind_fix "$@" ;;
-  teardown)    kind_teardown "$@" ;;
-  *) die "unknown subcommand: $cmd (expected: triage|implement|review|fix|teardown)" ;;
-esac
+# Run when the control plane dispatches the job. Exchanges the dispatch token,
+# then dispatches to the requested kind. Falls back to the legacy label-driven
+# command path when no FACTORY_RUN_ID is present.
+factory_dispatch_main() {
+  factory_authorize_runner
+  factory_emit_dashboard_link
+  factory_heartbeat "starting"
+
+  case "${FACTORY_KIND:-}" in
+    triage|triage-ready-issues)
+      kind_triage "${FACTORY_TARGET:-}"
+      ;;
+    implement|implementation)
+      kind_implement "${FACTORY_TARGET:-}"
+      ;;
+    review)
+      kind_review "${FACTORY_TARGET:-}"
+      ;;
+    fix)
+      kind_fix "${FACTORY_TARGET:-}"
+      ;;
+    teardown)
+      kind_teardown "${FACTORY_TARGET:-}"
+      ;;
+    status|stop)
+      log "control-plane dispatch for kind '$FACTORY_KIND' not yet implemented; finishing"
+      factory_complete "factory_stopped" "kind $FACTORY_KIND: not dispatched"
+      ;;
+    '')
+      die "FACTORY_KIND is required when dispatch context is set" ;;
+    *)
+      die "unknown FACTORY_KIND: $FACTORY_KIND" ;;
+  esac
+}
+
+# Legacy label-driven entrypoint, kept until repositories are migrated to the
+# single dispatch workflow.
+factory_legacy_main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    triage)      kind_triage "$@" ;;
+    implement)   kind_implement "$@" ;;
+    review)      kind_review "$@" ;;
+    fix)         kind_fix "$@" ;;
+    teardown)    kind_teardown "$@" ;;
+    *) die "unknown subcommand: $cmd (expected: triage|implement|review|fix|teardown)" ;;
+  esac
+}
+
+if [ -n "${FACTORY_RUN_ID:-}" ] || [ -n "${FACTORY_KIND:-}" ]; then
+  factory_dispatch_main
+else
+  # first positional argument is the legacy subcommand
+  factory_legacy_main "$@"
+fi
