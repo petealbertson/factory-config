@@ -73,5 +73,6 @@ jobs:
           FACTORY_GIT_AUTHOR_EMAIL: "fabrica@noreply.github.com"
           GITHUB_ACTIONS: "true"
         run: |
+          echo "::add-mask::${FACTORY_DISPATCH_TOKEN}"
           cd ~/factory
           bash run.sh
