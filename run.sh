@@ -294,6 +294,26 @@ run_pi() {
   pi --model "$model" -p "$prompt"
 }
 
+# Submit a formal PR review, falling back to a plain comment if GitHub rejects
+# the formal review (e.g. a bot cannot approve its own PR).
+# Args: $1=pr $2=body-file $3=event (APPROVE|REQUEST_CHANGES|COMMENT)
+factory_submit_review() {
+  local pr="$1" body_file="$2" event="${3:-COMMENT}"
+  local flag
+  case "$event" in
+    APPROVE) flag="--approve" ;;
+    REQUEST_CHANGES) flag="--request-changes" ;;
+    *) flag="--comment" ;;
+  esac
+
+  if gh pr review "$pr" --repo "$REPO_SLUG" "$flag" --body-file "$body_file" 2>/dev/null; then
+    return 0
+  fi
+
+  log "warning: formal review $event failed; falling back to comment"
+  gh pr comment "$pr" --repo "$REPO_SLUG" --body-file "$body_file"
+}
+
 # The shared review-rules fragment, read by every review skill (specialists,
 # coordinator, and the trivial single pass). Centralized so the emission bar,
 # scope discipline, and FINDINGS output format are defined once.
@@ -481,18 +501,28 @@ kind_review() {
   # --- fetch diff ONCE; build a per-run workdir for inlined inputs/outputs ---
   local workdir; workdir="$(mktemp -d)"
   local diff_file="$workdir/diff"
-  gh pr diff "$pr" --repo "$REPO_SLUG" > "$diff_file" 2>/dev/null || cp /dev/null "$diff_file"
+  if ! gh pr diff "$pr" --repo "$REPO_SLUG" 2>/dev/null \
+       | python3 "$FACTORY_DIR/lib/diff-filter.py" > "$diff_file"; then
+    cp /dev/null "$diff_file"
+  fi
   local tier; tier="$(classify_tier "$diff_file")"
   log "risk tier: $tier"
+
+  local linked_issues_file="$workdir/linked-issues.md"
+  python3 "$FACTORY_DIR/lib/linked-issues.py" "$REPO_SLUG" "$pr" > "$linked_issues_file" 2>/dev/null \
+    || cp /dev/null "$linked_issues_file"
+  local linked_arg=""
+  [ -s "$linked_issues_file" ] && linked_arg="@$linked_issues_file"
 
   local findings perspectives
   if [ "$tier" = "trivial" ]; then
     findings="$(run_review_agent review "$REVIEW_MODEL" "$dir" \
       "@$(review_shared_file)" "@$(review_skill_file review)" "@$diff_file" \
+      ${linked_arg:+$linked_arg} \
       "You are reviewing PR #$pr in $REPO_SLUG (branch $branch). Follow the instructions inlined above. Output ONLY the findings block. This is review round $round of at most $max_rounds.")"
     perspectives="single pass"
   else
-    findings="$(run_multi_perspective "$workdir" "$diff_file" "$pr" "$branch" "$round" "$dir")"
+    findings="$(run_multi_perspective "$workdir" "$diff_file" "$pr" "$branch" "$round" "$dir" "$linked_arg")"
     perspectives="security · quality · performance · docs → coordinator"
   fi
 
@@ -507,11 +537,11 @@ kind_review() {
   if factory_is_point; then
     if [ "$count" -eq 0 ]; then
       printf '%s\n' "✅ **Approved** — review found no blocking issues (round $round, $perspectives)." > "$review_body_file"
-      gh pr review "$pr" --repo "$REPO_SLUG" --approve --body-file "$review_body_file"
+      factory_submit_review "$pr" "$review_body_file" APPROVE
       factory_complete "succeeded" "point review: no findings"
     else
       printf '%s\n' "🔍 Review findings ($count, $perspectives). Requesting changes.\n\n$findings" > "$review_body_file"
-      gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+      factory_submit_review "$pr" "$review_body_file" REQUEST_CHANGES
       factory_complete "succeeded" "point review: $count finding(s)"
     fi
     rm -rf "$workdir" 2>/dev/null || true
@@ -521,7 +551,7 @@ kind_review() {
   # Pipeline / legacy mode.
   if [ "$count" -eq 0 ]; then
     printf '%s\n' "✅ **Approved** — review found no blocking issues (round $round of $max_rounds, $perspectives). Ready for human review." > "$review_body_file"
-    gh pr review "$pr" --repo "$REPO_SLUG" --approve --body-file "$review_body_file"
+    factory_submit_review "$pr" "$review_body_file" APPROVE
     transition_label "$pr" "ready-for-review" "needs-human-review"
     factory_complete "needs_human_review" "review passed; needs human review"
     rm -rf "$workdir" 2>/dev/null || true
@@ -536,7 +566,7 @@ kind_review() {
 
   if [ -n "$prev_fingerprint" ] && [ "$fingerprint" = "$prev_fingerprint" ]; then
     printf '%s\n' "⚠️ **Repeated findings** after a fix pass (round $round of $max_rounds, $perspectives). The same issues survived unchanged; escalating to human input. Latest findings:\n\n$findings" > "$review_body_file"
-    gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+    factory_submit_review "$pr" "$review_body_file" REQUEST_CHANGES
     transition_label "$pr" "ready-for-review" "factory-blocked"
     factory_complete "factory_blocked" "repeated findings after fix"
     rm -rf "$workdir" 2>/dev/null || true
@@ -545,7 +575,7 @@ kind_review() {
 
   if [ "$round" -ge "$max_rounds" ]; then
     printf '%s\n' "⚠️ **Did not converge** after $max_rounds review rounds ($count finding(s) still open, $perspectives). Needs human input. Latest findings:\n\n$findings" > "$review_body_file"
-    gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+    factory_submit_review "$pr" "$review_body_file" REQUEST_CHANGES
     transition_label "$pr" "ready-for-review" "needs-human-review"
     factory_complete "needs_human_review" "needs human review after max rounds"
     rm -rf "$workdir" 2>/dev/null || true
@@ -553,7 +583,7 @@ kind_review() {
   fi
 
   printf '%s\n' "🔍 Review round $round: $count finding(s) ($perspectives). Requesting fixes.\n\n$findings" > "$review_body_file"
-  gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+  factory_submit_review "$pr" "$review_body_file" REQUEST_CHANGES
   transition_label "$pr" "ready-for-review" "fixes-requested"
   factory_complete "needs_fix" "review found $count issue(s)" "{\"findings_fingerprint\":\"$fingerprint\",\"round\":$round}"
   rm -rf "$workdir" 2>/dev/null || true
@@ -585,9 +615,9 @@ classify_tier() {
 # their outputs. All inputs inlined via @file; every agent runs --no-tools.
 # A specialist that errors/times out contributes an empty file and is simply
 # absent from the coordinator's inputs — the review proceeds on the rest.
-# Args: $1=workdir $2=diff_file $3=pr $4=branch $5=round $6=cwd
+# Args: $1=workdir $2=diff_file $3=pr $4=branch $5=round $6=cwd $7=optional @linked-issues
 run_multi_perspective() {
-  local workdir="$1" diff_file="$2" pr="$3" branch="$4" round="$5" cwd="$6"
+  local workdir="$1" diff_file="$2" pr="$3" branch="$4" round="$5" cwd="$6" linked_arg="$7"
   local shared; shared="$(review_shared_file)"
   local spec_prompt="You are a specialist reviewer on PR #$pr in $REPO_SLUG (branch $branch), review round $round of at most $MAX_ROUNDS. Follow the instructions inlined above. Output ONLY your findings block."
   local sec="$workdir/out.security" qual="$workdir/out.quality" perf="$workdir/out.performance" docs="$workdir/out.docs"
@@ -596,13 +626,13 @@ run_multi_perspective() {
   # Each in a subshell so a failure (set -e) cannot abort the parent. Outputs to
   # files; an empty file = that specialist contributed nothing.
   ( run_review_agent review-security  "$REVIEW_SECURITY_MODEL"    "$cwd" \
-      "@$shared" "@$(review_skill_file review-security)"  "@$diff_file" "$spec_prompt" > "$sec"  2>/dev/null ) &
+      "@$shared" "@$(review_skill_file review-security)"  "@$diff_file" ${linked_arg:+$linked_arg} "$spec_prompt" > "$sec"  2>/dev/null ) &
   ( run_review_agent review-quality   "$REVIEW_QUALITY_MODEL"     "$cwd" \
-      "@$shared" "@$(review_skill_file review-quality)"   "@$diff_file" "$spec_prompt" > "$qual" 2>/dev/null ) &
+      "@$shared" "@$(review_skill_file review-quality)"   "@$diff_file" ${linked_arg:+$linked_arg} "$spec_prompt" > "$qual" 2>/dev/null ) &
   ( run_review_agent review-performance "$REVIEW_PERFORMANCE_MODEL" "$cwd" \
-      "@$shared" "@$(review_skill_file review-performance)" "@$diff_file" "$spec_prompt" > "$perf" 2>/dev/null ) &
+      "@$shared" "@$(review_skill_file review-performance)" "@$diff_file" ${linked_arg:+$linked_arg} "$spec_prompt" > "$perf" 2>/dev/null ) &
   ( run_review_agent review-docs      "$REVIEW_DOCS_MODEL"        "$cwd" \
-      "@$shared" "@$(review_skill_file review-docs)"      "@$diff_file" "$spec_prompt" > "$docs" 2>/dev/null ) &
+      "@$shared" "@$(review_skill_file review-docs)"      "@$diff_file" ${linked_arg:+$linked_arg} "$spec_prompt" > "$docs" 2>/dev/null ) &
   wait
 
   local ran=""
@@ -617,8 +647,9 @@ run_multi_perspective() {
   # embeds the quote chars and breaks @file parsing (EISDIR / treat-as-prompt).
   run_review_agent review-coordinator "$REVIEW_MODEL" "$cwd" \
     "@$shared" "@$(review_skill_file review-coordinator)" "@$diff_file" \
+    ${linked_arg:+$linked_arg} \
     ${sec:+@$sec} ${qual:+@$qual} ${perf:+@$perf} ${docs:+@$docs} \
-    "You are the review coordinator for PR #$pr in $REPO_SLUG (branch $branch), round $round of at most $MAX_ROUNDS. The inlined sections above are: shared rules, your coordinator instructions, the diff, then each specialist's findings. Deduplicate, filter, renumber, and emit exactly one canonical findings block."
+    "You are the review coordinator for PR #$pr in $REPO_SLUG (branch $branch), round $round of at most $MAX_ROUNDS. The inlined sections above are: shared rules, your coordinator instructions, the diff, linked issues (if present), then each specialist's findings. Deduplicate, filter, renumber, and emit exactly one canonical findings block."
 }
 
 # -------------------------------------------------------------------- kind: fix
