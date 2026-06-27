@@ -11,27 +11,22 @@ service. GitHub long-polls the runner directly — no exe.dev API in the path,
 no SSH dispatch, no timeout. Workflows use `runs-on: [self-hosted, linux, X64]`
 and their `run:` steps execute locally, calling `~/factory/run.sh`.
 
-### Legacy label-driven path (default when no control-plane context)
-
-The loop is a **label-driven state machine** — one state label on a PR at a
-time, transitions drive the next step. No review fires on push; only at
-explicit state transitions.
-
 ### Control-plane dispatch path (single `workflow_dispatch`)
 
-`factory-app` can now dispatch a run directly via one `workflow_dispatch`
-event on `factory-dispatch.yml`. The workflow passes `FACTORY_RUN_ID`,
-`FACTORY_KIND`, `FACTORY_TARGET`, and a single-use `FACTORY_DISPATCH_TOKEN` to
-`run.sh`. The runner exchanges the dispatch token for a callback token and a
-role-specific GitHub App token, configures git identity/auth for the role,
-and runs the requested kind. In `pipeline` mode, completions such as
-`needs_review` and `needs_fix` are reported back to the control plane, which
-schedules the next review or fix pass so factory-managed PRs loop
-autonomously. In `point` mode the runner performs one bounded review or fix
-and stops. Review passes post formal PR reviews from the reviewer identity,
-while implement/fix commits and PRs use the implementer identity. When
-`FACTORY_RUN_ID`/`FACTORY_KIND` are absent, `run.sh` falls back to the legacy
-label-driven path unchanged.
+`factory-app` is the dispatcher. It starts a run by triggering `workflow_dispatch`
+on `.github/workflows/factory-dispatch.yml`. The workflow passes `FACTORY_RUN_ID`,
+`FACTORY_KIND`, `FACTORY_TARGET`, `FACTORY_MODE`, `FACTORY_ROUND`, and a single-use
+`FACTORY_DISPATCH_TOKEN` to `run.sh`. The runner exchanges the dispatch token for a
+callback token and a role-specific GitHub App token, configures git identity/auth
+for the role, and runs the requested kind.
+
+In `pipeline` mode, completions such as `needs_review` and `needs_fix` are reported
+back to the control plane, which schedules the next review or fix pass so
+factory-managed PRs loop autonomously. In `point` mode the runner performs one
+bounded review, fix, triage, or implementation and stops.
+
+Review passes post formal PR reviews from the reviewer identity, while
+implement/fix commits and PRs use the implementer identity.
 
 
 ```
@@ -44,21 +39,23 @@ PR: ready-for-review             ──► run.sh review
 PR closed                        ──► run.sh teardown
 ```
 
-Pull up any PR and its single state label tells you where it is. Bounded at 3
-review passes (initial + 2 fix rounds); if it can't converge, it lands on
-`needs-human-review` with the last findings instead of looping. An issue that
-isn't defined enough to act on lands on `needs-refinement` with the specific
-gaps before any implementation cycles are spent on it.
+The state machine is still visible through labels, but **only the control plane
+triggers the next step**. Pull up any PR and its single state label tells you
+where it is. Bounded at 3 review passes (initial + 2 fix rounds); if it can't
+converge, it lands on `needs-human-review` with the last findings instead of
+looping. An issue that isn't defined enough to act on lands on
+`needs-refinement` with the specific gaps before any implementation cycles are
+spent on it.
 
 ## What's here
 
 | Path | Purpose |
 |---|---|
-| `run.sh` | The runner. Subcommands: `triage`, `implement`, `review`, `fix`, `teardown`. |
+| `run.sh` | The runner. Dispatched kinds: `triage`, `implement`, `review`, `fix`, `teardown`. |
 | `.agents/skills/` | The `triage`, `implementation`, and `review` Pi skills (used by `run.sh`). |
 | `models.env` | Role → model bindings. Edit + commit + fan out to swap models. |
-| `templates/github/workflows/` | The four Actions, copied into consuming repos. |
-| `shelley-skills/factory-install/` | Skill: bind a fresh VM to a repo (register runner, write repo.env, ensure workflows/labels). |
+| `templates/github/workflows/` | One dispatch workflow, installed into consuming repos. |
+| `shelley-skills/factory-install/` | Skill: bind a fresh VM to a repo, register it with the control plane. |
 | `shelley-skills/factory-ops/` | Skill: add/swap inference providers, models, list VMs. |
 
 Not in git: `repo.env` (per-VM, written by `factory-install`), `state/`

@@ -6,24 +6,32 @@
 # One VM == one repo (the "repo VM"). This script is repo-agnostic; the repo it
 # targets is declared in repo.env. It is Rails-aware (db:prepare, worktrees).
 #
-# Subcommands (each is one step in the loop; the loop is driven by GitHub label
-# events, NOT by push):
-#   triage <issue>      gate before implement: is the issue defined enough? PROCEED -> implement, REFINE -> needs-refinement
-#   implement <issue>   implement a ready-for-implementation issue; open PR; label it ready-for-review
-#   review <pr>         one review pass; 0 findings -> needs-human-review, else fixes-requested (or needs-human-review at round 3)
-#   fix <pr>            one fix pass from saved findings; re-label ready-for-review
-#   teardown <pr>       on PR close: remove worktree, drop DB, delete branch, sync main, wipe state
+# Cloud factory runner. Invoked on a per-repo VM by a self-hosted GitHub
+# Actions runner that runs on this same VM:
+#   bash ~/factory/run.sh
 #
-# State machine (one state label on the PR/issue at a time):
-#   issue: ready-for-implementation -> [triage] -> implement  (PROCEED)
-#                                           └──> needs-refinement  (REFINE; human sharpens, re-labels ready-for-implementation)
-#   issue: ready-for-implementation -> [implement] -> PR: ready-for-review
-#   PR: ready-for-review -> [review] -> fixes-requested -> [fix] -> ready-for-review  (loop, max 3 reviews)
-#                                    -> [review, 0 findings OR round 3] -> needs-human-review (terminal)
-#   PR closed -> [teardown]
+# One VM == one repo (the "repo VM"). This script is repo-agnostic; the repo it
+# targets is declared in repo.env. It is Rails-aware (db:prepare, worktrees).
+#
+# Kinds (one step in the loop, dispatched by the control plane):
+#   triage-ready-issues/triage  gate before implement
+#   implement                   implement a ready issue; open PR
+#   review                      one review pass
+#   fix                         one fix pass from saved findings
+#   teardown                    on PR close: clean up worktree/DB/branch/state
+#
+# Dispatched environment (all set by the control plane):
+#   FACTORY_RUN_ID              control-plane run ID (required)
+#   FACTORY_KIND                triage|implement|review|fix|teardown
+#   FACTORY_TARGET              issue or PR number
+#   FACTORY_MODE                pipeline|point
+#   FACTORY_ROUND               current review round
+#   FACTORY_MAX_ROUNDS          round cap
+#   FACTORY_APP_URL             control-plane callback base URL
+#   FACTORY_DISPATCH_TOKEN      single-use runner token
 #
 # The round counter and last findings live in ~/factory/state/pr<N>.* so they
-# survive across the separate workflow runs that make up the loop.
+# survive across the workflow runs that make up the loop.
 #
 # PR stage == worktree + DB clone for one PR branch. Persists across implement /
 # review / fix until teardown.
@@ -75,10 +83,10 @@ die() { printf '\033[1;31m[factory error]\033[0m %s\n' "$*" >&2; exit 1; }
 sanitize() { echo "$1" | tr -c 'a-zA-Z0-9' '_' | tr 'A-Z' 'a-z'; }
 json_escape() { printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])'; }
 
-# Control-plane helpers. Legacy label-driven runs have no FACTORY_RUN_ID.
+# Control-plane helpers. In v1 run.sh is dispatch-only.
 factory_in_dispatch() { [ -n "${FACTORY_RUN_ID:-}" ]; }
-factory_is_pipeline() { ! factory_in_dispatch || [ "${FACTORY_MODE:-pipeline}" = "pipeline" ]; }
-factory_is_point() { factory_in_dispatch && [ "${FACTORY_MODE:-}" = "point" ]; }
+factory_is_pipeline() { [ "${FACTORY_MODE:-pipeline}" = "pipeline" ]; }
+factory_is_point() { [ "${FACTORY_MODE:-}" = "point" ]; }
 
 # Stable fingerprint for comparing finding blocks across rounds.
 factory_findings_fingerprint() {
@@ -86,9 +94,8 @@ factory_findings_fingerprint() {
 }
 
 # --------------------------------------------------------------------- control-plane
-# Callbacks are optional; when FACTORY_APP_URL + FACTORY_RUN_ID are unset the
-# runner keeps working in legacy label-driven mode. The callback token is only
-# needed when posting back to the control plane.
+# Callbacks are optional; the runner can still finish work if the control
+# plane is unreachable, but it will not be able to schedule follow-ups.
 factory_callback_base_url() {
   if [ -n "${FACTORY_APP_URL:-}" ] && [ -n "${FACTORY_RUN_ID:-}" ] && [[ "$FACTORY_RUN_ID" =~ ^[0-9]+$ ]]; then
     printf '%s/internal/runs/%s' "${FACTORY_APP_URL%/}" "$FACTORY_RUN_ID"
@@ -675,8 +682,7 @@ kind_teardown() {
 # ------------------------------------------------------------------------ main
 
 # Run when the control plane dispatches the job. Exchanges the dispatch token,
-# then dispatches to the requested kind. Falls back to the legacy label-driven
-# command path when no FACTORY_RUN_ID is present.
+# then dispatches to the requested kind.
 factory_dispatch_main() {
   factory_authorize_runner
   factory_configure_git_identity
@@ -700,34 +706,13 @@ factory_dispatch_main() {
     teardown)
       kind_teardown "${FACTORY_TARGET:-}"
       ;;
-    status|stop)
-      log "control-plane dispatch for kind '$FACTORY_KIND' not yet implemented; finishing"
-      factory_complete "factory_stopped" "kind $FACTORY_KIND: not dispatched"
-      ;;
     '')
-      die "FACTORY_KIND is required when dispatch context is set" ;;
+      die "FACTORY_KIND is required" ;;
     *)
       die "unknown FACTORY_KIND: $FACTORY_KIND" ;;
   esac
 }
 
-# Legacy label-driven entrypoint, kept until repositories are migrated to the
-# single dispatch workflow.
-factory_legacy_main() {
-  local cmd="${1:-}"; shift || true
-  case "$cmd" in
-    triage)      kind_triage "$@" ;;
-    implement)   kind_implement "$@" ;;
-    review)      kind_review "$@" ;;
-    fix)         kind_fix "$@" ;;
-    teardown)    kind_teardown "$@" ;;
-    *) die "unknown subcommand: $cmd (expected: triage|implement|review|fix|teardown)" ;;
-  esac
-}
-
-if [ -n "${FACTORY_RUN_ID:-}" ] || [ -n "${FACTORY_KIND:-}" ]; then
-  factory_dispatch_main
-else
-  # first positional argument is the legacy subcommand
-  factory_legacy_main "$@"
-fi
+: "${FACTORY_RUN_ID:?FACTORY_RUN_ID is required; run.sh is dispatch-only in v1}"
+: "${FACTORY_KIND:?FACTORY_KIND is required}"
+factory_dispatch_main

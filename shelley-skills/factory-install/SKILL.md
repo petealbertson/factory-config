@@ -120,8 +120,13 @@ cd ~/actions-runner
   --token "$TOKEN" --labels "factory,$REPO_SLUG" --replace
 ```
 (`--replace` evicts a dead runner of the same name after a VM refresh; harmless
-on first run. `$REPO_SLUG` label lets workflows pin `runs-on` to this repo's
-runner if you ever run multi-repo on one VM.)
+on first run. `$REPO_SLUG` label lets the control plane dispatch to this repo's
+runner.)
+
+Capture the runner name for control-plane registration:
+```bash
+RUNNER_NAME="$(awk -F'=' '/runnerName/ {print $2}' ~/actions-runner/.runner | tr -d '[:space:]')"
+```
 
 ## Step 5 — enable the service (install the hardened unit first)
 
@@ -147,47 +152,43 @@ grep -q "mise/shims" ~/actions-runner/.path \
   || die "runner .path lacks mise — jobs will fail with 'command not found'"
 ```
 
-## Step 6 — ensure workflows in the repo
+## Step 6 — install the dispatch workflow
 
-Copy the four factory workflows; commit only if changed. **Add files
-explicitly** (VM policy forbids `git add -A`/`git add .`). First copy, then
-remove any stale `review-and-fix.yml` / `human-review.yml` left from the old
-design (label-driven state machine replaced push-driven review + the smoke
-server):
+`factory-config` now ships one dispatch-only workflow: `factory-dispatch.yml`.
+Install it and remove the legacy per-kind workflows that used to fire on
+labels. **Add files explicitly** (VM policy forbids `git add -A`/`git add .`):
 ```bash
 mkdir -p "$REPO_DIR/.github/workflows"
-cp ~/factory/templates/github/workflows/*.yml "$REPO_DIR/.github/workflows/"
-# remove stale workflows from prior factory designs:
-#  - review-and-fix.yml / human-review.yml: the old push-driven review + smoke
-#    server, replaced by the label-driven state machine.
-#  - implement-ready-issues.yml: the issue workflow now runs triage first, so it
-#    was renamed triage-ready-issues.yml. Both fire on `ready-for-implementation`,
-#    so the old one MUST be removed or two jobs race on the same label.
+cp ~/factory/templates/github/workflows/factory-dispatch.yml "$REPO_DIR/.github/workflows/"
+# Remove legacy label-driven workflows (v1 is dispatch-only).
 rm -f "$REPO_DIR/.github/workflows/review-and-fix.yml" \
       "$REPO_DIR/.github/workflows/human-review.yml" \
-      "$REPO_DIR/.github/workflows/implement-ready-issues.yml"
+      "$REPO_DIR/.github/workflows/implement-ready-issues.yml" \
+      "$REPO_DIR/.github/workflows/triage-ready-issues.yml" \
+      "$REPO_DIR/.github/workflows/review.yml" \
+      "$REPO_DIR/.github/workflows/fix.yml" \
+      "$REPO_DIR/.github/workflows/teardown.yml"
 cd "$REPO_DIR"
 if ! git diff --quiet -- .github/workflows 2>/dev/null \
    || [ -n "$(git ls-files --others --exclude-standard -- .github/workflows)" ]; then
-  git add .github/workflows/triage-ready-issues.yml \
-          .github/workflows/review.yml \
-          .github/workflows/fix.yml \
-          .github/workflows/teardown.yml
+  git add .github/workflows/factory-dispatch.yml
   git rm --cached .github/workflows/review-and-fix.yml \
              .github/workflows/human-review.yml \
-             .github/workflows/implement-ready-issues.yml 2>/dev/null || true
-  git commit -m "factory: workflows (triage gate + label-driven state machine)"
+             .github/workflows/implement-ready-issues.yml \
+             .github/workflows/triage-ready-issues.yml \
+             .github/workflows/review.yml \
+             .github/workflows/fix.yml \
+             .github/workflows/teardown.yml 2>/dev/null || true
+  git commit -m "factory: dispatch-only workflow for v1"
   git push
 fi
 ```
 
-## Step 7 — labels
+## Step 7 — seed labels
 
-The loop is a label-driven state machine. One **state** label is present on a
-PR at a time (the runner removes the old before adding the new on every
-transition). Seed all of them; idempotent (`|| true` — `gh` errors if a label
-exists). The three `factory-*` labels are new in Milestone 6 and used by the
-control-plane dispatch path; the legacy path ignores them:
+State labels are still used as human-readable markers, but only the control
+plane advances the loop. Seed all Fabrica labels idempotently (`|| true` —
+`gh` errors if a label already exists):
 ```bash
 gh label create ready-for-implementation --repo "$REPO_SLUG" --color 0E8A16 \
   --description "Issue planned; factory will triage then implement" 2>/dev/null || true
@@ -206,12 +207,11 @@ gh label create factory-blocked      --repo "$REPO_SLUG" --color D4A017 \
 gh label create factory-stopped      --repo "$REPO_SLUG" --color 808080 \
   --description "Fabrica work was intentionally stopped by a human" 2>/dev/null || true
 ```
-Only `ready-for-implementation` (issue, -> triage) and the three PR labels
-(`ready-for-review`, `fixes-requested`) are trigger labels for the legacy
-workflows; `needs-refinement`, `needs-human-review`, `factory-blocked`, and
-`factory-stopped` are terminal (a human re-labels to resume).
+`needs-refinement`, `needs-human-review`, `factory-blocked`, and
+`factory-stopped` are terminal states (a human re-labels or uses `@fabrica
+continue` to resume).
 
-## Step 8 — verify the loop
+## Step 8 — verify the runner
 
 The definitive check: GitHub sees this runner online.
 ```bash
@@ -221,13 +221,44 @@ gh api repos/$REPO_SLUG/actions/runners \
 ```
 If state is `offline`, check `journalctl -u gh-actions-runner -n 50`.
 
+## Step 9 — register with the control plane (when configured)
+
+If `FACTORY_APP_URL` is set in `repo.env`, register this VM/repo binding with
+the `factory-app` control plane. The control plane must already know the repo
+(e.g. from a webhook or from `bin/rails factory:install`); this call just
+reports the runner that will execute its dispatches.
+
+```bash
+: "${FACTORY_APP_URL:?FACTORY_APP_URL is not set; skipping control-plane registration}"
+: "${FACTORY_BOOTSTRAP_SECRET:?FACTORY_BOOTSTRAP_SECRET is not set; cannot authenticate to control plane}"
+
+VM_NAME="${VM_NAME:-$(hostname)}"
+RUNNER_NAME="${RUNNER_NAME:-$(awk -F'=' '/runnerName/ {print $2}' ~/actions-runner/.runner | tr -d '[:space:]')}"
+RUNNER_LABELS="$(gh api repos/$REPO_SLUG/actions/runners --jq '.runners[] | select(.name=="'$RUNNER_NAME'") | .labels | map(.name) | join(",")')"
+
+curl -fsS -X POST "$FACTORY_APP_URL/repos/$REPO_SLUG/bootstrap" \
+  -H "Authorization: Bearer $FACTORY_BOOTSTRAP_SECRET" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"vm_name\": \"$VM_NAME\",
+    \"runner_name\": \"$RUNNER_NAME\",
+    \"runner_labels\": [$(echo "$RUNNER_LABELS" | tr ',' '\n' | sed 's/^/"/' | sed 's/$/"/' | paste -sd, -)]
+  }"
+```
+
+If the control plane is not configured, note that in the report and continue.
+The VM remains a GitHub self-hosted runner; the control plane cannot dispatch
+to it until registered.
+
 ## Report to the user
 
 One line + the trigger recipe. No narrative:
 
 - ✅ `<owner>/<repo>` is wired. Runner online.
-- To fire: create an issue, plan it with an agent, then `gh issue edit <n>
-  --repo <owner>/<repo> --add-label ready-for-implementation`.
+- If the control plane is configured and the repo is bootstrapped: `@fabrica
+  implement`, `@fabrica review`, `@fabrica status`, etc. on issues/PRs.
+- Otherwise, label an issue `ready-for-implementation` to trigger the triage
+  → implement → review loop (the control plane or label transition will start it).
 - The PR will walk `ready-for-review` → `fixes-requested` → `needs-human-review`
   on its own. Watch for `needs-human-review`; smoke-test the branch on the VM
   directly, then merge to trigger teardown.
@@ -244,7 +275,9 @@ needs manual attention. That's the monthly flow.
 - Clone the app repo (that's `rails-exe-setup`).
 - Touch `~/.pi/agent/auth.json` or provider keys (that's `factory-ops`).
 - Edit `models.env` (that's `factory-ops`).
-- Ask for a GitHub token, secret, or API key. The `gh` on the VM is the only
-  credential; it mints the short-lived runner token itself.
+- Ask the user for a GitHub token, secret, or API key. The `gh` on the VM is
+  the on-VM credential; it mints the short-lived runner token itself.
+- Read `FACTORY_BOOTSTRAP_SECRET` from `repo.env`; that secret (if configured)
+  is what the control plane accepts for VM registration.
 - Run any factory task (implement/review). This skill only wires the trigger;
   `run.sh` does the work, invoked by GitHub via the runner.
