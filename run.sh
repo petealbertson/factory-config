@@ -455,7 +455,9 @@ kind_implement() {
 
   if factory_in_dispatch && factory_is_pipeline; then
     gh pr edit "$pr" --repo "$REPO_SLUG" --add-label "factory-managed" 2>/dev/null || true
-    factory_complete "needs_review" "PR #$pr opened; scheduling review"
+    local pr_metadata
+    pr_metadata="$(python3 -c "import json,sys; print(json.dumps({'pr_number':int(sys.argv[1]),'pr_url':sys.argv[2],'branch':sys.argv[3],'issue_number':int(sys.argv[4])}))" "$pr" "$pr_url" "$branch" "$issue")"
+    factory_complete "needs_review" "PR #$pr opened; scheduling review" "$pr_metadata"
   elif factory_in_dispatch && factory_is_point; then
     factory_complete "succeeded" "PR #$pr opened (point mode)"
   fi
