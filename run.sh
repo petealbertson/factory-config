@@ -240,7 +240,9 @@ transition_label() {
   if [ -n "$old" ]; then
     gh pr edit "$pr" --repo "$REPO_SLUG" --remove-label "$old" 2>/dev/null || true
   fi
-  gh pr edit "$pr" --repo "$REPO_SLUG" --add-label "$new"
+  # Tolerate a missing target label (e.g. factory-blocked on legacy repos) so
+  # the runner does not strand a PR with no state label.
+  gh pr edit "$pr" --repo "$REPO_SLUG" --add-label "$new" 2>/dev/null || true
 }
 
 # ensure the template DB exists (migrated). cheap to call repeatedly.
