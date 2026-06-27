@@ -42,6 +42,14 @@ on:
         options:
           - pipeline
           - point
+      round:
+        description: "Current review round"
+        required: true
+        type: string
+      max_rounds:
+        description: "Maximum review rounds"
+        required: true
+        type: string
       factory_app_url:
         description: "Fabrica control plane URL"
         required: true
@@ -75,6 +83,8 @@ jobs:
           FACTORY_TARGET: ${{ github.event.inputs.target }}
           FACTORY_TARGET_TYPE: ${{ github.event.inputs.target_type }}
           FACTORY_MODE: ${{ github.event.inputs.mode }}
+          FACTORY_ROUND: ${{ github.event.inputs.round }}
+          FACTORY_MAX_ROUNDS: ${{ github.event.inputs.max_rounds }}
           FACTORY_APP_URL: ${{ github.event.inputs.factory_app_url }}
           FACTORY_DISPATCH_TOKEN: ${{ github.event.inputs.dispatch_token }}
           FACTORY_GIT_AUTHOR_NAME: ${{ github.event.inputs.git_author_name }}

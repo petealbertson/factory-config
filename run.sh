@@ -75,6 +75,16 @@ die() { printf '\033[1;31m[factory error]\033[0m %s\n' "$*" >&2; exit 1; }
 sanitize() { echo "$1" | tr -c 'a-zA-Z0-9' '_' | tr 'A-Z' 'a-z'; }
 json_escape() { printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])'; }
 
+# Control-plane helpers. Legacy label-driven runs have no FACTORY_RUN_ID.
+factory_in_dispatch() { [ -n "${FACTORY_RUN_ID:-}" ]; }
+factory_is_pipeline() { ! factory_in_dispatch || [ "${FACTORY_MODE:-pipeline}" = "pipeline" ]; }
+factory_is_point() { factory_in_dispatch && [ "${FACTORY_MODE:-}" = "point" ]; }
+
+# Stable fingerprint for comparing finding blocks across rounds.
+factory_findings_fingerprint() {
+  printf '%s' "$1" | python3 -c 'import hashlib,sys,re; t=re.sub(r"\s+", " ", sys.stdin.read().lower()); sys.stdout.write(hashlib.md5(t.encode()).hexdigest())'
+}
+
 # --------------------------------------------------------------------- control-plane
 # Callbacks are optional; when FACTORY_APP_URL + FACTORY_RUN_ID are unset the
 # runner keeps working in legacy label-driven mode. The callback token is only
@@ -124,9 +134,15 @@ factory_event() {
   factory_post "events" "$payload"
 }
 factory_complete() {
-  local state="$1"; shift || true
+  local state="$1"
+  shift || true
   local message="${1:-}"
-  local payload; payload="{\"state\":\"$state\",\"message\":\"$(json_escape "$message")\"}"
+  shift || true
+  local metadata="${1:-}"
+  local meta_field=""
+  [ -n "$metadata" ] && meta_field=",\"metadata\":$metadata"
+  local payload
+  payload="{\"state\":\"$state\",\"message\":\"$(json_escape "$message")\"$meta_field}"
   factory_post "complete" "$payload"
 }
 factory_fail() { factory_complete "failed" "$1"; }
@@ -224,7 +240,9 @@ transition_label() {
   if [ -n "$old" ]; then
     gh pr edit "$pr" --repo "$REPO_SLUG" --remove-label "$old" 2>/dev/null || true
   fi
-  gh pr edit "$pr" --repo "$REPO_SLUG" --add-label "$new"
+  # Tolerate a missing target label (e.g. factory-blocked on legacy repos) so
+  # the runner does not strand a PR with no state label.
+  gh pr edit "$pr" --repo "$REPO_SLUG" --add-label "$new" 2>/dev/null || true
 }
 
 # ensure the template DB exists (migrated). cheap to call repeatedly.
@@ -365,7 +383,7 @@ Please address the blockers above, then remove the \`needs-refinement\` label an
       # transition_label works on PR labels; for an issue use gh issue edit.
       gh issue edit "$issue" --repo "$REPO_SLUG" --remove-label "ready-for-implementation" 2>/dev/null || true
       gh issue edit "$issue" --repo "$REPO_SLUG" --add-label "needs-refinement"
-      factory_complete "factory_stopped" "needs refinement"
+      factory_complete "needs_refinement" "needs refinement"
       return 0
       ;;
     *)
@@ -407,6 +425,13 @@ kind_implement() {
   log "PR #$pr opened; transitioning issue -> review"
   gh issue edit "$issue" --repo "$REPO_SLUG" --remove-label "ready-for-implementation" 2>/dev/null || true
   gh pr edit "$pr" --repo "$REPO_SLUG" --add-label "ready-for-review"
+
+  if factory_in_dispatch && factory_is_pipeline; then
+    gh pr edit "$pr" --repo "$REPO_SLUG" --add-label "factory-managed" 2>/dev/null || true
+    factory_complete "needs_review" "PR #$pr opened; scheduling review"
+  elif factory_in_dispatch && factory_is_point; then
+    factory_complete "succeeded" "PR #$pr opened (point mode)"
+  fi
 }
 
 # ----------------------------------------------------------------- kind: review
@@ -415,9 +440,9 @@ kind_implement() {
 # specialists in parallel, then a coordinator pass dedupes/filters/renumbers
 # their outputs into one canonical FINDINGS block.
 #
-# 0 findings OR round==MAX -> needs-human-review; else save findings and label
-# fixes-requested. The output contract (FINDINGS: block, ^F[0-9] counted) is
-# unchanged from the single-reviewer design; only how findings are produced.
+# Pipeline: 0 findings OR repeated/max rounds -> terminal, else schedule fix.
+# Point mode: one review only, no loop. The output contract (FINDINGS: block,
+# ^F[0-9] counted) is unchanged from the single-reviewer design.
 kind_review() {
   local pr="$1"
   factory_heartbeat "review"
@@ -425,11 +450,26 @@ kind_review() {
   local branch; branch="$(gh pr view "$pr" --repo "$REPO_SLUG" --json headRefName -q .headRefName)"
   local dir; dir="$(ensure_pr_stage "$branch")"
   mkdir -p "$(state_dir)"
-  local rfile; rfile="$(round_file "$pr")"
-  local round; round=$(( ( $(cat "$rfile" 2>/dev/null || echo 0) ) + 1 ))
-  echo "$round" > "$rfile"
 
-  log "review round $round/$MAX_ROUNDS on PR #$pr ($branch)"
+  # Ensure pipeline/take_over PRs carry the factory-managed label.
+  if factory_is_pipeline; then
+    gh pr edit "$pr" --repo "$REPO_SLUG" --add-label "factory-managed" 2>/dev/null || true
+  fi
+
+  # Determine round + mode. Legacy runs count from the local state file;
+  # dispatched runs receive the current round from the control plane.
+  local rfile; rfile="$(round_file "$pr")"
+  local round max_rounds
+  if factory_in_dispatch; then
+    round="${FACTORY_ROUND:-1}"
+    max_rounds="${FACTORY_MAX_ROUNDS:-3}"
+  else
+    round=$(( ( $(cat "$rfile" 2>/dev/null || echo 0) ) + 1 ))
+    echo "$round" > "$rfile"
+    max_rounds="$MAX_ROUNDS"
+  fi
+
+  log "review round $round/$max_rounds on PR #$pr ($branch)"
 
   # --- fetch diff ONCE; build a per-run workdir for inlined inputs/outputs ---
   local workdir; workdir="$(mktemp -d)"
@@ -442,7 +482,7 @@ kind_review() {
   if [ "$tier" = "trivial" ]; then
     findings="$(run_review_agent review "$REVIEW_MODEL" "$dir" \
       "@$(review_shared_file)" "@$(review_skill_file review)" "@$diff_file" \
-      "You are reviewing PR #$pr in $REPO_SLUG (branch $branch). Follow the instructions inlined above. Output ONLY the findings block. This is review round $round of at most $MAX_ROUNDS.")"
+      "You are reviewing PR #$pr in $REPO_SLUG (branch $branch). Follow the instructions inlined above. Output ONLY the findings block. This is review round $round of at most $max_rounds.")"
     perspectives="single pass"
   else
     findings="$(run_multi_perspective "$workdir" "$diff_file" "$pr" "$branch" "$round" "$dir")"
@@ -453,36 +493,62 @@ kind_review() {
   log "round $round: $count finding(s)"
   factory_event "review_findings_posted" "round $round: $count finding(s)"
 
+  local fingerprint; fingerprint="$(factory_findings_fingerprint "$findings")"
   local review_body_file="$workdir/review_body"
 
+  # Point mode = one review only, no loop.
+  if factory_is_point; then
+    if [ "$count" -eq 0 ]; then
+      printf '%s\n' "✅ **Approved** — review found no blocking issues (round $round, $perspectives)." > "$review_body_file"
+      gh pr review "$pr" --repo "$REPO_SLUG" --approve --body-file "$review_body_file"
+      factory_complete "succeeded" "point review: no findings"
+    else
+      printf '%s\n' "🔍 Review findings ($count, $perspectives). Requesting changes.\n\n$findings" > "$review_body_file"
+      gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+      factory_complete "succeeded" "point review: $count finding(s)"
+    fi
+    rm -rf "$workdir" 2>/dev/null || true
+    return 0
+  fi
+
+  # Pipeline / legacy mode.
   if [ "$count" -eq 0 ]; then
-    printf '%s\n' "✅ **Approved** — review found no blocking issues (round $round of $MAX_ROUNDS, $perspectives). Ready for human review." > "$review_body_file"
+    printf '%s\n' "✅ **Approved** — review found no blocking issues (round $round of $max_rounds, $perspectives). Ready for human review." > "$review_body_file"
     gh pr review "$pr" --repo "$REPO_SLUG" --approve --body-file "$review_body_file"
     transition_label "$pr" "ready-for-review" "needs-human-review"
-    factory_complete "factory_stopped" "needs human review"
+    factory_complete "needs_human_review" "review passed; needs human review"
     rm -rf "$workdir" 2>/dev/null || true
     return 0
   fi
 
-  # findings remain — save them for the fix pass
-  printf '%s\n' "$findings" > "$(findings_file "$pr")"
+  # Save findings for the fix pass and look for repeated finding deadlock.
+  local ffile; ffile="$(findings_file "$pr")"
+  local prev_fingerprint=""
+  [ -f "$ffile" ] && prev_fingerprint="$(factory_findings_fingerprint "$(cat "$ffile")")"
+  printf '%s\n' "$findings" > "$ffile"
 
-  if [ "$round" -ge "$MAX_ROUNDS" ]; then
-    printf '%s\n' "⚠️ **Did not converge** after $MAX_ROUNDS review rounds ($count finding(s) still open, $perspectives). Needs human input. Latest findings:
+  if [ -n "$prev_fingerprint" ] && [ "$fingerprint" = "$prev_fingerprint" ]; then
+    printf '%s\n' "⚠️ **Repeated findings** after a fix pass (round $round of $max_rounds, $perspectives). The same issues survived unchanged; escalating to human input. Latest findings:\n\n$findings" > "$review_body_file"
+    gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+    transition_label "$pr" "ready-for-review" "factory-blocked"
+    factory_complete "factory_blocked" "repeated findings after fix"
+    rm -rf "$workdir" 2>/dev/null || true
+    return 0
+  fi
 
-$findings" > "$review_body_file"
+  if [ "$round" -ge "$max_rounds" ]; then
+    printf '%s\n' "⚠️ **Did not converge** after $max_rounds review rounds ($count finding(s) still open, $perspectives). Needs human input. Latest findings:\n\n$findings" > "$review_body_file"
     gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
     transition_label "$pr" "ready-for-review" "needs-human-review"
-    factory_complete "factory_stopped" "needs human review after max rounds"
+    factory_complete "needs_human_review" "needs human review after max rounds"
     rm -rf "$workdir" 2>/dev/null || true
     return 0
   fi
 
-  printf '%s\n' "🔍 Review round $round: $count finding(s) ($perspectives). Requesting fixes.
-
-$findings" > "$review_body_file"
+  printf '%s\n' "🔍 Review round $round: $count finding(s) ($perspectives). Requesting fixes.\n\n$findings" > "$review_body_file"
   gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
   transition_label "$pr" "ready-for-review" "fixes-requested"
+  factory_complete "needs_fix" "review found $count issue(s)" "{\"findings_fingerprint\":\"$fingerprint\",\"round\":$round}"
   rm -rf "$workdir" 2>/dev/null || true
 }
 
@@ -549,8 +615,9 @@ run_multi_perspective() {
 }
 
 # -------------------------------------------------------------------- kind: fix
-# One fix pass driven by the findings saved by the last review. Re-labels
-# ready-for-review, which fires the next review.
+# One fix pass driven by the findings saved by the last review. In pipeline
+# mode the control plane schedules the next review; in point mode this is one
+# bounded fix and stop.
 kind_fix() {
   local pr="$1"
   factory_heartbeat "fix"
@@ -568,7 +635,14 @@ kind_fix() {
 $findings" >/dev/null
 
   factory_event "fix_pushed" "PR #$pr"
+
+  if factory_is_point; then
+    factory_complete "succeeded" "point fix complete"
+    return 0
+  fi
+
   transition_label "$pr" "fixes-requested" "ready-for-review"
+  factory_complete "needs_review" "fix pushed; scheduling re-review"
 }
 
 # --------------------------------------------------------------- kind: teardown
@@ -595,6 +669,7 @@ kind_teardown() {
   git -C "$REPO_DIR" checkout "$GIT_BRANCH_MAIN" 2>/dev/null || true
   git -C "$REPO_DIR" pull --ff-only 2>/dev/null && log "pulled latest $GIT_BRANCH_MAIN" || true
   factory_event "teardown_completed" "PR #$pr"
+  factory_complete "succeeded" "teardown complete"
 }
 
 # ------------------------------------------------------------------------ main
