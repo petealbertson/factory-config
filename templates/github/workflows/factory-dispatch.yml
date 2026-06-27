@@ -29,12 +29,12 @@ on:
         required: true
         type: string
       target_type:
-        description: "issue or pull_request"
+        description: "issue or pr"
         required: true
         type: choice
         options:
           - issue
-          - pull_request
+          - pr
       mode:
         description: "pipeline or point"
         required: true
