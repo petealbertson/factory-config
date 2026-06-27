@@ -6,24 +6,32 @@
 # One VM == one repo (the "repo VM"). This script is repo-agnostic; the repo it
 # targets is declared in repo.env. It is Rails-aware (db:prepare, worktrees).
 #
-# Subcommands (each is one step in the loop; the loop is driven by GitHub label
-# events, NOT by push):
-#   triage <issue>      gate before implement: is the issue defined enough? PROCEED -> implement, REFINE -> needs-refinement
-#   implement <issue>   implement a ready-for-implementation issue; open PR; label it ready-for-review
-#   review <pr>         one review pass; 0 findings -> needs-human-review, else fixes-requested (or needs-human-review at round 3)
-#   fix <pr>            one fix pass from saved findings; re-label ready-for-review
-#   teardown <pr>       on PR close: remove worktree, drop DB, delete branch, sync main, wipe state
+# Cloud factory runner. Invoked on a per-repo VM by a self-hosted GitHub
+# Actions runner that runs on this same VM:
+#   bash ~/factory/run.sh
 #
-# State machine (one state label on the PR/issue at a time):
-#   issue: ready-for-implementation -> [triage] -> implement  (PROCEED)
-#                                           └──> needs-refinement  (REFINE; human sharpens, re-labels ready-for-implementation)
-#   issue: ready-for-implementation -> [implement] -> PR: ready-for-review
-#   PR: ready-for-review -> [review] -> fixes-requested -> [fix] -> ready-for-review  (loop, max 3 reviews)
-#                                    -> [review, 0 findings OR round 3] -> needs-human-review (terminal)
-#   PR closed -> [teardown]
+# One VM == one repo (the "repo VM"). This script is repo-agnostic; the repo it
+# targets is declared in repo.env. It is Rails-aware (db:prepare, worktrees).
+#
+# Kinds (one step in the loop, dispatched by the control plane):
+#   triage-ready-issues/triage  gate before implement
+#   implement                   implement a ready issue; open PR
+#   review                      one review pass
+#   fix                         one fix pass from saved findings
+#   teardown                    on PR close: clean up worktree/DB/branch/state
+#
+# Dispatched environment (all set by the control plane):
+#   FACTORY_RUN_ID              control-plane run ID (required)
+#   FACTORY_KIND                triage|implement|review|fix|teardown
+#   FACTORY_TARGET              issue or PR number
+#   FACTORY_MODE                pipeline|point
+#   FACTORY_ROUND               current review round
+#   FACTORY_MAX_ROUNDS          round cap
+#   FACTORY_APP_URL             control-plane callback base URL
+#   FACTORY_DISPATCH_TOKEN      single-use runner token
 #
 # The round counter and last findings live in ~/factory/state/pr<N>.* so they
-# survive across the separate workflow runs that make up the loop.
+# survive across the workflow runs that make up the loop.
 #
 # PR stage == worktree + DB clone for one PR branch. Persists across implement /
 # review / fix until teardown.
@@ -75,10 +83,10 @@ die() { printf '\033[1;31m[factory error]\033[0m %s\n' "$*" >&2; exit 1; }
 sanitize() { echo "$1" | tr -c 'a-zA-Z0-9' '_' | tr 'A-Z' 'a-z'; }
 json_escape() { printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])'; }
 
-# Control-plane helpers. Legacy label-driven runs have no FACTORY_RUN_ID.
+# Control-plane helpers. In v1 run.sh is dispatch-only.
 factory_in_dispatch() { [ -n "${FACTORY_RUN_ID:-}" ]; }
-factory_is_pipeline() { ! factory_in_dispatch || [ "${FACTORY_MODE:-pipeline}" = "pipeline" ]; }
-factory_is_point() { factory_in_dispatch && [ "${FACTORY_MODE:-}" = "point" ]; }
+factory_is_pipeline() { [ "${FACTORY_MODE:-pipeline}" = "pipeline" ]; }
+factory_is_point() { [ "${FACTORY_MODE:-}" = "point" ]; }
 
 # Stable fingerprint for comparing finding blocks across rounds.
 factory_findings_fingerprint() {
@@ -86,9 +94,8 @@ factory_findings_fingerprint() {
 }
 
 # --------------------------------------------------------------------- control-plane
-# Callbacks are optional; when FACTORY_APP_URL + FACTORY_RUN_ID are unset the
-# runner keeps working in legacy label-driven mode. The callback token is only
-# needed when posting back to the control plane.
+# Callbacks are optional; the runner can still finish work if the control
+# plane is unreachable, but it will not be able to schedule follow-ups.
 factory_callback_base_url() {
   if [ -n "${FACTORY_APP_URL:-}" ] && [ -n "${FACTORY_RUN_ID:-}" ] && [[ "$FACTORY_RUN_ID" =~ ^[0-9]+$ ]]; then
     printf '%s/internal/runs/%s' "${FACTORY_APP_URL%/}" "$FACTORY_RUN_ID"
@@ -287,6 +294,26 @@ run_pi() {
   pi --model "$model" -p "$prompt"
 }
 
+# Submit a formal PR review, falling back to a plain comment if GitHub rejects
+# the formal review (e.g. a bot cannot approve its own PR).
+# Args: $1=pr $2=body-file $3=event (APPROVE|REQUEST_CHANGES|COMMENT)
+factory_submit_review() {
+  local pr="$1" body_file="$2" event="${3:-COMMENT}"
+  local flag
+  case "$event" in
+    APPROVE) flag="--approve" ;;
+    REQUEST_CHANGES) flag="--request-changes" ;;
+    *) flag="--comment" ;;
+  esac
+
+  if gh pr review "$pr" --repo "$REPO_SLUG" "$flag" --body-file "$body_file" 2>/dev/null; then
+    return 0
+  fi
+
+  log "warning: formal review $event failed; falling back to comment"
+  gh pr comment "$pr" --repo "$REPO_SLUG" --body-file "$body_file"
+}
+
 # The shared review-rules fragment, read by every review skill (specialists,
 # coordinator, and the trivial single pass). Centralized so the emission bar,
 # scope discipline, and FINDINGS output format are defined once.
@@ -474,18 +501,28 @@ kind_review() {
   # --- fetch diff ONCE; build a per-run workdir for inlined inputs/outputs ---
   local workdir; workdir="$(mktemp -d)"
   local diff_file="$workdir/diff"
-  gh pr diff "$pr" --repo "$REPO_SLUG" > "$diff_file" 2>/dev/null || cp /dev/null "$diff_file"
+  if ! gh pr diff "$pr" --repo "$REPO_SLUG" 2>/dev/null \
+       | python3 "$FACTORY_DIR/lib/diff-filter.py" > "$diff_file"; then
+    cp /dev/null "$diff_file"
+  fi
   local tier; tier="$(classify_tier "$diff_file")"
   log "risk tier: $tier"
+
+  local linked_issues_file="$workdir/linked-issues.md"
+  python3 "$FACTORY_DIR/lib/linked-issues.py" "$REPO_SLUG" "$pr" > "$linked_issues_file" 2>/dev/null \
+    || cp /dev/null "$linked_issues_file"
+  local linked_arg=""
+  [ -s "$linked_issues_file" ] && linked_arg="@$linked_issues_file"
 
   local findings perspectives
   if [ "$tier" = "trivial" ]; then
     findings="$(run_review_agent review "$REVIEW_MODEL" "$dir" \
       "@$(review_shared_file)" "@$(review_skill_file review)" "@$diff_file" \
+      ${linked_arg:+$linked_arg} \
       "You are reviewing PR #$pr in $REPO_SLUG (branch $branch). Follow the instructions inlined above. Output ONLY the findings block. This is review round $round of at most $max_rounds.")"
     perspectives="single pass"
   else
-    findings="$(run_multi_perspective "$workdir" "$diff_file" "$pr" "$branch" "$round" "$dir")"
+    findings="$(run_multi_perspective "$workdir" "$diff_file" "$pr" "$branch" "$round" "$dir" "$linked_arg")"
     perspectives="security · quality · performance · docs → coordinator"
   fi
 
@@ -500,11 +537,11 @@ kind_review() {
   if factory_is_point; then
     if [ "$count" -eq 0 ]; then
       printf '%s\n' "✅ **Approved** — review found no blocking issues (round $round, $perspectives)." > "$review_body_file"
-      gh pr review "$pr" --repo "$REPO_SLUG" --approve --body-file "$review_body_file"
+      factory_submit_review "$pr" "$review_body_file" APPROVE
       factory_complete "succeeded" "point review: no findings"
     else
       printf '%s\n' "🔍 Review findings ($count, $perspectives). Requesting changes.\n\n$findings" > "$review_body_file"
-      gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+      factory_submit_review "$pr" "$review_body_file" REQUEST_CHANGES
       factory_complete "succeeded" "point review: $count finding(s)"
     fi
     rm -rf "$workdir" 2>/dev/null || true
@@ -514,7 +551,7 @@ kind_review() {
   # Pipeline / legacy mode.
   if [ "$count" -eq 0 ]; then
     printf '%s\n' "✅ **Approved** — review found no blocking issues (round $round of $max_rounds, $perspectives). Ready for human review." > "$review_body_file"
-    gh pr review "$pr" --repo "$REPO_SLUG" --approve --body-file "$review_body_file"
+    factory_submit_review "$pr" "$review_body_file" APPROVE
     transition_label "$pr" "ready-for-review" "needs-human-review"
     factory_complete "needs_human_review" "review passed; needs human review"
     rm -rf "$workdir" 2>/dev/null || true
@@ -529,7 +566,7 @@ kind_review() {
 
   if [ -n "$prev_fingerprint" ] && [ "$fingerprint" = "$prev_fingerprint" ]; then
     printf '%s\n' "⚠️ **Repeated findings** after a fix pass (round $round of $max_rounds, $perspectives). The same issues survived unchanged; escalating to human input. Latest findings:\n\n$findings" > "$review_body_file"
-    gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+    factory_submit_review "$pr" "$review_body_file" REQUEST_CHANGES
     transition_label "$pr" "ready-for-review" "factory-blocked"
     factory_complete "factory_blocked" "repeated findings after fix"
     rm -rf "$workdir" 2>/dev/null || true
@@ -538,7 +575,7 @@ kind_review() {
 
   if [ "$round" -ge "$max_rounds" ]; then
     printf '%s\n' "⚠️ **Did not converge** after $max_rounds review rounds ($count finding(s) still open, $perspectives). Needs human input. Latest findings:\n\n$findings" > "$review_body_file"
-    gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+    factory_submit_review "$pr" "$review_body_file" REQUEST_CHANGES
     transition_label "$pr" "ready-for-review" "needs-human-review"
     factory_complete "needs_human_review" "needs human review after max rounds"
     rm -rf "$workdir" 2>/dev/null || true
@@ -546,7 +583,7 @@ kind_review() {
   fi
 
   printf '%s\n' "🔍 Review round $round: $count finding(s) ($perspectives). Requesting fixes.\n\n$findings" > "$review_body_file"
-  gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
+  factory_submit_review "$pr" "$review_body_file" REQUEST_CHANGES
   transition_label "$pr" "ready-for-review" "fixes-requested"
   factory_complete "needs_fix" "review found $count issue(s)" "{\"findings_fingerprint\":\"$fingerprint\",\"round\":$round}"
   rm -rf "$workdir" 2>/dev/null || true
@@ -578,9 +615,9 @@ classify_tier() {
 # their outputs. All inputs inlined via @file; every agent runs --no-tools.
 # A specialist that errors/times out contributes an empty file and is simply
 # absent from the coordinator's inputs — the review proceeds on the rest.
-# Args: $1=workdir $2=diff_file $3=pr $4=branch $5=round $6=cwd
+# Args: $1=workdir $2=diff_file $3=pr $4=branch $5=round $6=cwd $7=optional @linked-issues
 run_multi_perspective() {
-  local workdir="$1" diff_file="$2" pr="$3" branch="$4" round="$5" cwd="$6"
+  local workdir="$1" diff_file="$2" pr="$3" branch="$4" round="$5" cwd="$6" linked_arg="$7"
   local shared; shared="$(review_shared_file)"
   local spec_prompt="You are a specialist reviewer on PR #$pr in $REPO_SLUG (branch $branch), review round $round of at most $MAX_ROUNDS. Follow the instructions inlined above. Output ONLY your findings block."
   local sec="$workdir/out.security" qual="$workdir/out.quality" perf="$workdir/out.performance" docs="$workdir/out.docs"
@@ -589,13 +626,13 @@ run_multi_perspective() {
   # Each in a subshell so a failure (set -e) cannot abort the parent. Outputs to
   # files; an empty file = that specialist contributed nothing.
   ( run_review_agent review-security  "$REVIEW_SECURITY_MODEL"    "$cwd" \
-      "@$shared" "@$(review_skill_file review-security)"  "@$diff_file" "$spec_prompt" > "$sec"  2>/dev/null ) &
+      "@$shared" "@$(review_skill_file review-security)"  "@$diff_file" ${linked_arg:+$linked_arg} "$spec_prompt" > "$sec"  2>/dev/null ) &
   ( run_review_agent review-quality   "$REVIEW_QUALITY_MODEL"     "$cwd" \
-      "@$shared" "@$(review_skill_file review-quality)"   "@$diff_file" "$spec_prompt" > "$qual" 2>/dev/null ) &
+      "@$shared" "@$(review_skill_file review-quality)"   "@$diff_file" ${linked_arg:+$linked_arg} "$spec_prompt" > "$qual" 2>/dev/null ) &
   ( run_review_agent review-performance "$REVIEW_PERFORMANCE_MODEL" "$cwd" \
-      "@$shared" "@$(review_skill_file review-performance)" "@$diff_file" "$spec_prompt" > "$perf" 2>/dev/null ) &
+      "@$shared" "@$(review_skill_file review-performance)" "@$diff_file" ${linked_arg:+$linked_arg} "$spec_prompt" > "$perf" 2>/dev/null ) &
   ( run_review_agent review-docs      "$REVIEW_DOCS_MODEL"        "$cwd" \
-      "@$shared" "@$(review_skill_file review-docs)"      "@$diff_file" "$spec_prompt" > "$docs" 2>/dev/null ) &
+      "@$shared" "@$(review_skill_file review-docs)"      "@$diff_file" ${linked_arg:+$linked_arg} "$spec_prompt" > "$docs" 2>/dev/null ) &
   wait
 
   local ran=""
@@ -610,8 +647,9 @@ run_multi_perspective() {
   # embeds the quote chars and breaks @file parsing (EISDIR / treat-as-prompt).
   run_review_agent review-coordinator "$REVIEW_MODEL" "$cwd" \
     "@$shared" "@$(review_skill_file review-coordinator)" "@$diff_file" \
+    ${linked_arg:+$linked_arg} \
     ${sec:+@$sec} ${qual:+@$qual} ${perf:+@$perf} ${docs:+@$docs} \
-    "You are the review coordinator for PR #$pr in $REPO_SLUG (branch $branch), round $round of at most $MAX_ROUNDS. The inlined sections above are: shared rules, your coordinator instructions, the diff, then each specialist's findings. Deduplicate, filter, renumber, and emit exactly one canonical findings block."
+    "You are the review coordinator for PR #$pr in $REPO_SLUG (branch $branch), round $round of at most $MAX_ROUNDS. The inlined sections above are: shared rules, your coordinator instructions, the diff, linked issues (if present), then each specialist's findings. Deduplicate, filter, renumber, and emit exactly one canonical findings block."
 }
 
 # -------------------------------------------------------------------- kind: fix
@@ -675,8 +713,7 @@ kind_teardown() {
 # ------------------------------------------------------------------------ main
 
 # Run when the control plane dispatches the job. Exchanges the dispatch token,
-# then dispatches to the requested kind. Falls back to the legacy label-driven
-# command path when no FACTORY_RUN_ID is present.
+# then dispatches to the requested kind.
 factory_dispatch_main() {
   factory_authorize_runner
   factory_configure_git_identity
@@ -700,34 +737,13 @@ factory_dispatch_main() {
     teardown)
       kind_teardown "${FACTORY_TARGET:-}"
       ;;
-    status|stop)
-      log "control-plane dispatch for kind '$FACTORY_KIND' not yet implemented; finishing"
-      factory_complete "factory_stopped" "kind $FACTORY_KIND: not dispatched"
-      ;;
     '')
-      die "FACTORY_KIND is required when dispatch context is set" ;;
+      die "FACTORY_KIND is required" ;;
     *)
       die "unknown FACTORY_KIND: $FACTORY_KIND" ;;
   esac
 }
 
-# Legacy label-driven entrypoint, kept until repositories are migrated to the
-# single dispatch workflow.
-factory_legacy_main() {
-  local cmd="${1:-}"; shift || true
-  case "$cmd" in
-    triage)      kind_triage "$@" ;;
-    implement)   kind_implement "$@" ;;
-    review)      kind_review "$@" ;;
-    fix)         kind_fix "$@" ;;
-    teardown)    kind_teardown "$@" ;;
-    *) die "unknown subcommand: $cmd (expected: triage|implement|review|fix|teardown)" ;;
-  esac
-}
-
-if [ -n "${FACTORY_RUN_ID:-}" ] || [ -n "${FACTORY_KIND:-}" ]; then
-  factory_dispatch_main
-else
-  # first positional argument is the legacy subcommand
-  factory_legacy_main "$@"
-fi
+: "${FACTORY_RUN_ID:?FACTORY_RUN_ID is required; run.sh is dispatch-only in v1}"
+: "${FACTORY_KIND:?FACTORY_KIND is required}"
+factory_dispatch_main
