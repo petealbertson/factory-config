@@ -186,7 +186,8 @@ fi
 The loop is a label-driven state machine. One **state** label is present on a
 PR at a time (the runner removes the old before adding the new on every
 transition). Seed all of them; idempotent (`|| true` — `gh` errors if a label
-exists):
+exists). The three `factory-*` labels are new in Milestone 6 and used by the
+control-plane dispatch path; the legacy path ignores them:
 ```bash
 gh label create ready-for-implementation --repo "$REPO_SLUG" --color 0E8A16 \
   --description "Issue planned; factory will triage then implement" 2>/dev/null || true
@@ -198,11 +199,17 @@ gh label create fixes-requested      --repo "$REPO_SLUG" --color D93F0B \
   --description "Reviewer found issues; awaiting a fix pass" 2>/dev/null || true
 gh label create needs-human-review   --repo "$REPO_SLUG" --color 5319E7 \
   --description "Agents done (approved or capped); waiting on a human" 2>/dev/null || true
+gh label create factory-managed      --repo "$REPO_SLUG" --color 0052CC \
+  --description "Fabrica is managing autonomous review/fix/re-review for this PR" 2>/dev/null || true
+gh label create factory-blocked      --repo "$REPO_SLUG" --color D4A017 \
+  --description "Fabrica needs human or infrastructure input to continue" 2>/dev/null || true
+gh label create factory-stopped      --repo "$REPO_SLUG" --color 808080 \
+  --description "Fabrica work was intentionally stopped by a human" 2>/dev/null || true
 ```
 Only `ready-for-implementation` (issue, -> triage) and the three PR labels
-(`ready-for-review`, `fixes-requested`) are trigger labels for the workflows;
-`needs-refinement` and `needs-human-review` are terminal (a human re-labels to
-resume).
+(`ready-for-review`, `fixes-requested`) are trigger labels for the legacy
+workflows; `needs-refinement`, `needs-human-review`, `factory-blocked`, and
+`factory-stopped` are terminal (a human re-labels to resume).
 
 ## Step 8 — verify the loop
 
