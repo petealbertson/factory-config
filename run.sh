@@ -141,7 +141,8 @@ factory_authorize_runner() {
   [ -n "${FACTORY_DISPATCH_TOKEN:-}" ] || return 0
 
   local url="$base/authorize_runner"
-  local payload; payload="{\"dispatch_token\":\"$(json_escape "$FACTORY_DISPATCH_TOKEN")\"}"
+  local kind="${FACTORY_KIND:-}"
+  local payload; payload="{\"dispatch_token\":\"$(json_escape "$FACTORY_DISPATCH_TOKEN")\",\"kind\":\"$(json_escape "$kind")\"}"
   local resp
   if ! resp="$(curl -fsS -X POST -H "Content-Type: application/json" -d "$payload" "$url" 2>/dev/null)"; then
     log "warning: could not exchange dispatch token; callbacks disabled"
@@ -154,14 +155,17 @@ factory_authorize_runner() {
   reviewer_token="$(printf '%s' "$resp" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin).get("reviewer_token",""))')"
 
   if [ -n "$callback_token" ]; then
+    echo "::add-mask::$callback_token"
     export FACTORY_CALLBACK_TOKEN="$callback_token"
   else
     log "warning: control plane did not return a callback token"
   fi
   if [ -n "$app_token" ]; then
+    echo "::add-mask::$app_token"
     export FACTORY_APP_TOKEN="$app_token"
   fi
   if [ -n "$reviewer_token" ]; then
+    echo "::add-mask::$reviewer_token"
     export FACTORY_REVIEWER_TOKEN="$reviewer_token"
   fi
 }
@@ -185,7 +189,9 @@ factory_configure_github_token() {
 
   case "$kind" in
     review)
-      token="${FACTORY_REVIEWER_TOKEN:-$FACTORY_APP_TOKEN}" ;;
+      # Use the reviewer token only; falling back to the implementer token
+      # would let a review pass silently hold contents:write.
+      token="${FACTORY_REVIEWER_TOKEN:-}" ;;
     *)
       token="${FACTORY_APP_TOKEN:-}" ;;
   esac
@@ -443,17 +449,18 @@ kind_review() {
     perspectives="security · quality · performance · docs → coordinator"
   fi
 
-  # best-effort cleanup of the per-run workdir
-  rm -rf "$workdir" 2>/dev/null || true
-
   local count; count="$(printf '%s' "$findings" | grep -c '^F[0-9]' || true)"
   log "round $round: $count finding(s)"
   factory_event "review_findings_posted" "round $round: $count finding(s)"
 
+  local review_body_file="$workdir/review_body"
+
   if [ "$count" -eq 0 ]; then
-    gh pr comment "$pr" --repo "$REPO_SLUG" --body "✅ **Approved** — review found no blocking issues (round $round of $MAX_ROUNDS, $perspectives). Ready for human review."
+    printf '%s\n' "✅ **Approved** — review found no blocking issues (round $round of $MAX_ROUNDS, $perspectives). Ready for human review." > "$review_body_file"
+    gh pr review "$pr" --repo "$REPO_SLUG" --approve --body-file "$review_body_file"
     transition_label "$pr" "ready-for-review" "needs-human-review"
     factory_complete "factory_stopped" "needs human review"
+    rm -rf "$workdir" 2>/dev/null || true
     return 0
   fi
 
@@ -461,18 +468,22 @@ kind_review() {
   printf '%s\n' "$findings" > "$(findings_file "$pr")"
 
   if [ "$round" -ge "$MAX_ROUNDS" ]; then
-    gh pr comment "$pr" --repo "$REPO_SLUG" --body "⚠️ **Did not converge** after $MAX_ROUNDS review rounds ($count finding(s) still open, $perspectives). Needs human input. Latest findings:
+    printf '%s\n' "⚠️ **Did not converge** after $MAX_ROUNDS review rounds ($count finding(s) still open, $perspectives). Needs human input. Latest findings:
 
-$findings"
+$findings" > "$review_body_file"
+    gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
     transition_label "$pr" "ready-for-review" "needs-human-review"
     factory_complete "factory_stopped" "needs human review after max rounds"
+    rm -rf "$workdir" 2>/dev/null || true
     return 0
   fi
 
-  gh pr comment "$pr" --repo "$REPO_SLUG" --body "🔍 Review round $round: $count finding(s) ($perspectives). Requesting fixes.
+  printf '%s\n' "🔍 Review round $round: $count finding(s) ($perspectives). Requesting fixes.
 
-$findings"
+$findings" > "$review_body_file"
+  gh pr review "$pr" --repo "$REPO_SLUG" --request-changes --body-file "$review_body_file"
   transition_label "$pr" "ready-for-review" "fixes-requested"
+  rm -rf "$workdir" 2>/dev/null || true
 }
 
 # Classify a PR's risk tier from its diff: trivial | full. Two tiers only.

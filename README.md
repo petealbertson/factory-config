@@ -22,10 +22,12 @@ explicit state transitions.
 `factory-app` can now dispatch a run directly via one `workflow_dispatch`
 event on `factory-dispatch.yml`. The workflow passes `FACTORY_RUN_ID`,
 `FACTORY_KIND`, `FACTORY_TARGET`, and a single-use `FACTORY_DISPATCH_TOKEN` to
-`run.sh`. The runner exchanges the dispatch token for a callback token and
-role-specific GitHub App tokens, configures git identity/auth, and runs the
-requested kind. When `FACTORY_RUN_ID`/`FACTORY_KIND` are absent, `run.sh`
-falls back to the legacy label-driven path unchanged.
+`run.sh`. The runner exchanges the dispatch token for a callback token and a
+role-specific GitHub App token, configures git identity/auth for the role,
+and runs the requested kind. Review passes post formal PR reviews from the
+reviewer identity, while implement/fix commits and PRs use the implementer
+identity. When `FACTORY_RUN_ID`/`FACTORY_KIND` are absent, `run.sh` falls back
+to the legacy label-driven path unchanged.
 
 
 ```
